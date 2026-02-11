@@ -48,6 +48,7 @@ logger = logging.getLogger("app.services.simple_analysis_service")
 
 # 配置服务实例
 config_service = ConfigService()
+REPORT_SUMMARY_MAX_CHARS = 100_000
 
 
 async def get_provider_by_model_name(model_name: str) -> str:
@@ -269,6 +270,44 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
         }
 
 
+def get_active_system_models_sync() -> tuple[Optional[str], Optional[str]]:
+    """
+    从 MongoDB 的活跃系统配置读取 quick/deep 模型。
+    """
+    try:
+        from pymongo import MongoClient
+        from app.core.config import settings
+
+        client = MongoClient(settings.MONGO_URI)
+        db = client[settings.MONGO_DB]
+        doc = db.system_configs.find_one({"is_active": True}, sort=[("version", -1)])
+        client.close()
+        if not doc:
+            return None, None
+
+        system_settings = doc.get("system_settings") or {}
+        quick_model = system_settings.get("quick_analysis_model") or system_settings.get("quick_think_llm")
+        deep_model = system_settings.get("deep_analysis_model") or system_settings.get("deep_think_llm")
+        return quick_model, deep_model
+    except Exception:
+        return None, None
+
+
+def _get_explicit_models_from_parameters(parameters) -> tuple[Optional[str], Optional[str]]:
+    """
+    仅当 quick/deep 模型字段由调用方显式传入时才返回。
+    避免 AnalysisParameters 默认值（qwen-*）被误判为用户指定。
+    """
+    if not parameters:
+        return None, None
+    fields_set = getattr(parameters, "model_fields_set", set()) or set()
+    quick_model = getattr(parameters, "quick_analysis_model", None)
+    deep_model = getattr(parameters, "deep_analysis_model", None)
+    if "quick_analysis_model" in fields_set and "deep_analysis_model" in fields_set and quick_model and deep_model:
+        return str(quick_model), str(deep_model)
+    return None, None
+
+
 def _get_env_api_key_for_provider(provider: str) -> str:
     """
     从环境变量获取指定供应商的 API Key
@@ -290,6 +329,7 @@ def _get_env_api_key_for_provider(provider: str) -> str:
         "openrouter": "OPENROUTER_API_KEY",
         "siliconflow": "SILICONFLOW_API_KEY",
         "qianfan": "QIANFAN_API_KEY",
+        "volcengine": "VOLCENGINE_API_KEY",
         "302ai": "AI302_API_KEY",
     }
 
@@ -320,6 +360,7 @@ def _get_default_backend_url(provider: str) -> str:
         "anthropic": "https://api.anthropic.com",
         "openrouter": "https://openrouter.ai/api/v1",
         "qianfan": "https://qianfan.baidubce.com/v2",
+        "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
         "302ai": "https://api.302.ai/v1",
     }
 
@@ -525,6 +566,8 @@ def create_analysis_config(
             config["backend_url"] = "https://generativelanguage.googleapis.com/v1beta"
         elif llm_provider == "qianfan":
             config["backend_url"] = "https://aip.baidubce.com"
+        elif llm_provider == "volcengine":
+            config["backend_url"] = "https://ark.cn-beijing.volces.com/api/v3"
         else:
             # 🔧 未知厂家，尝试从数据库获取厂家的 default_base_url
             logger.warning(f"⚠️  未知厂家 {llm_provider}，尝试从数据库获取配置")
@@ -727,6 +770,19 @@ class SimpleAnalysisService:
 
         return trading_graph
 
+    @staticmethod
+    def _normalize_request_symbol(request: SingleAnalysisRequest) -> str:
+        """Normalize request symbol fields and keep backward compatibility.
+
+        Some callers only fill `symbol`, while legacy paths still read `stock_code`.
+        This method ensures both fields are consistently populated.
+        """
+        stock_code = request.get_symbol()
+        if stock_code:
+            request.symbol = stock_code
+            request.stock_code = stock_code
+        return stock_code
+
     async def create_analysis_task(
         self,
         user_id: str,
@@ -738,7 +794,7 @@ class SimpleAnalysisService:
             task_id = str(uuid.uuid4())
 
             # 🔧 使用 get_symbol() 方法获取股票代码（兼容 symbol 和 stock_code 字段）
-            stock_code = request.get_symbol()
+            stock_code = self._normalize_request_symbol(request)
             if not stock_code:
                 raise ValueError("股票代码不能为空")
 
@@ -814,7 +870,7 @@ class SimpleAnalysisService:
     ):
         """在后台执行分析任务"""
         # 🔧 使用 get_symbol() 方法获取股票代码（兼容 symbol 和 stock_code 字段）
-        stock_code = request.get_symbol()
+        stock_code = self._normalize_request_symbol(request)
 
         # 添加最外层的异常捕获，确保所有异常都被记录
         try:
@@ -836,6 +892,20 @@ class SimpleAnalysisService:
 
             # 获取市场类型
             market_type = request.parameters.market_type if request.parameters else "A股"
+
+            # 进度展示使用的 provider（按系统默认模型或请求模型动态推断）
+            try:
+                default_quick_model, default_deep_model = get_active_system_models_sync()
+                explicit_quick_model, explicit_deep_model = _get_explicit_models_from_parameters(request.parameters)
+                provider_model = (
+                    explicit_quick_model
+                    or explicit_deep_model
+                    or default_quick_model
+                    or default_deep_model
+                )
+                tracker_provider = get_provider_by_model_name_sync(provider_model) if provider_model else "unknown"
+            except Exception:
+                tracker_provider = "unknown"
 
             # 获取分析日期并转换为字符串格式
             analysis_date = request.parameters.analysis_date if request.parameters else None
@@ -905,7 +975,7 @@ class SimpleAnalysisService:
                     task_id=task_id,
                     analysts=request.parameters.selected_analysts or ["market", "fundamentals"],
                     research_depth=request.parameters.research_depth or "标准",
-                    llm_provider="dashscope"
+                    llm_provider=tracker_provider
                 )
                 logger.info(f"✅ [线程] 进度跟踪器创建完成: {task_id}")
                 return tracker
@@ -1166,16 +1236,13 @@ class SimpleAnalysisService:
 
             research_depth = request.parameters.research_depth if request.parameters else "标准"
 
-            # 1. 检查前端是否指定了模型
-            if (request.parameters and
-                hasattr(request.parameters, 'quick_analysis_model') and
-                hasattr(request.parameters, 'deep_analysis_model') and
-                request.parameters.quick_analysis_model and
-                request.parameters.deep_analysis_model):
+            # 1. 检查调用方是否显式指定了模型（忽略 AnalysisParameters 默认值）
+            explicit_quick_model, explicit_deep_model = _get_explicit_models_from_parameters(request.parameters)
+            if explicit_quick_model and explicit_deep_model:
 
                 # 使用前端指定的模型
-                quick_model = request.parameters.quick_analysis_model
-                deep_model = request.parameters.deep_analysis_model
+                quick_model = explicit_quick_model
+                deep_model = explicit_deep_model
 
                 logger.info(f"📝 [分析服务] 用户指定模型: quick={quick_model}, deep={deep_model}")
 
@@ -1202,11 +1269,25 @@ class SimpleAnalysisService:
                     logger.info(f"✅ 用户选择的模型验证通过: quick={quick_model}, deep={deep_model}")
 
             else:
-                # 2. 自动推荐模型
-                quick_model, deep_model = capability_service.recommend_models_for_depth(
-                    research_depth
-                )
-                logger.info(f"🤖 自动推荐模型: quick={quick_model}, deep={deep_model}")
+                # 2. 未显式指定模型时，优先使用系统默认 quick/deep 模型
+                quick_model, deep_model = get_active_system_models_sync()
+
+                if quick_model and deep_model:
+                    logger.info(f"📝 [分析服务] 使用系统默认模型: quick={quick_model}, deep={deep_model}")
+                    validation = capability_service.validate_model_pair(
+                        quick_model, deep_model, research_depth
+                    )
+                    if not validation["valid"]:
+                        logger.warning("⚠️ 系统默认模型不满足当前深度要求，自动切换到推荐模型")
+                        quick_model, deep_model = capability_service.recommend_models_for_depth(
+                            research_depth
+                        )
+                        logger.info(f"✅ 已切换推荐模型: quick={quick_model}, deep={deep_model}")
+                else:
+                    quick_model, deep_model = capability_service.recommend_models_for_depth(
+                        research_depth
+                    )
+                    logger.info(f"🤖 自动推荐模型: quick={quick_model}, deep={deep_model}")
 
             # 🔧 根据快速模型和深度模型分别查找对应的供应商和 API URL
             quick_provider_info = get_provider_and_url_by_model_sync(quick_model)
@@ -1728,9 +1809,9 @@ class SimpleAnalysisService:
             if isinstance(reports, dict) and 'final_trade_decision' in reports:
                 final_decision_content = reports['final_trade_decision']
                 if isinstance(final_decision_content, str) and len(final_decision_content) > 50:
-                    # 提取前200个字符作为摘要（与web目录完全一致）
-                    summary = final_decision_content[:200].replace('#', '').replace('*', '').strip()
-                    if len(final_decision_content) > 200:
+                    # 提取摘要（放宽到10w字符，避免飞书报告过度截断）
+                    summary = final_decision_content[:REPORT_SUMMARY_MAX_CHARS].replace('#', '').replace('*', '').strip()
+                    if len(final_decision_content) > REPORT_SUMMARY_MAX_CHARS:
                         summary += "..."
                     logger.info(f"📝 [SUMMARY] 从final_trade_decision提取摘要: {len(summary)}字符")
 
@@ -1738,8 +1819,8 @@ class SimpleAnalysisService:
             if not summary and isinstance(state, dict):
                 final_decision = state.get('final_trade_decision', '')
                 if isinstance(final_decision, str) and len(final_decision) > 50:
-                    summary = final_decision[:200].replace('#', '').replace('*', '').strip()
-                    if len(final_decision) > 200:
+                    summary = final_decision[:REPORT_SUMMARY_MAX_CHARS].replace('#', '').replace('*', '').strip()
+                    if len(final_decision) > REPORT_SUMMARY_MAX_CHARS:
                         summary += "..."
                     logger.info(f"📝 [SUMMARY] 从state.final_trade_decision提取摘要: {len(summary)}字符")
 
@@ -1762,8 +1843,8 @@ class SimpleAnalysisService:
                 # 尝试从其他报告中提取摘要
                 for report_name, content in reports.items():
                     if isinstance(content, str) and len(content) > 100:
-                        summary = content[:200].replace('#', '').replace('*', '').strip()
-                        if len(content) > 200:
+                        summary = content[:REPORT_SUMMARY_MAX_CHARS].replace('#', '').replace('*', '').strip()
+                        if len(content) > REPORT_SUMMARY_MAX_CHARS:
                             summary += "..."
                         logger.info(f"📝 [SUMMARY] 从{report_name}提取摘要: {len(summary)}字符")
                         break
@@ -2242,7 +2323,7 @@ class SimpleAnalysisService:
                 "status": {"$in": ["processing", "running", "pending"]},
                 "$or": [
                     {"started_at": {"$lt": cutoff_time}},
-                    {"created_at": {"$lt": cutoff_time, "started_at": None}}
+                    {"created_at": {"$lt": cutoff_time}, "started_at": None}
                 ]
             }
 
@@ -2300,7 +2381,7 @@ class SimpleAnalysisService:
                 "status": {"$in": ["processing", "running", "pending"]},
                 "$or": [
                     {"started_at": {"$lt": cutoff_time}},
-                    {"created_at": {"$lt": cutoff_time, "started_at": None}}
+                    {"created_at": {"$lt": cutoff_time}, "started_at": None}
                 ]
             }
 

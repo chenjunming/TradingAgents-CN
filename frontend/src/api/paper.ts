@@ -47,6 +47,27 @@ export interface PlaceOrderPayload {
   analysis_id?: string
 }
 
+export interface LongportSyncPayload {
+  symbols?: string[]
+  replace_existing_longport_positions?: boolean
+  sync_cash?: boolean
+}
+
+export interface LongportSyncResponse {
+  source: 'longport'
+  synced_positions_count: number
+  removed_positions_count: number
+  skipped_positions_count: number
+  synced_cash: Record<string, number>
+  positions_preview: Array<{
+    code: string
+    market: string
+    quantity: number
+    external_symbol: string
+  }>
+  updated_at: string
+}
+
 export const paperApi = {
   async getAccount() {
     return ApiClient.get<GetAccountResponse>('/api/paper/account')
@@ -63,5 +84,8 @@ export const paperApi = {
   async resetAccount() {
     // 后端要求 confirm=true
     return ApiClient.post<{ message: string; cash: number }>(`/api/paper/reset?confirm=true`)
+  },
+  async syncLongportPositions(data: LongportSyncPayload = {}) {
+    return ApiClient.post<LongportSyncResponse>('/api/paper/sync/longport/positions', data, { showLoading: true })
   }
 }

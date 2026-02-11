@@ -1,4 +1,4 @@
-from typing import Annotated, Dict
+from typing import Annotated, Any, Dict, Optional
 import time
 import os
 from datetime import datetime
@@ -214,6 +214,230 @@ def get_config():
 def set_config(config):
     """设置配置（兼容性包装）"""
     config_manager.save_settings(config)
+
+
+def _resolve_openai_compatible_api_key() -> tuple[str, str]:
+    """
+    解析 OpenAI 兼容接口所需 API Key。
+    优先级：
+    1) OPENAI_API_KEY（标准）
+    2) VOLCENGINE_API_KEY（火山方舟）
+    3) DASHSCOPE_API_KEY（通义兼容网关）
+    """
+    candidates = [
+        ("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "").strip()),
+        ("VOLCENGINE_API_KEY", os.getenv("VOLCENGINE_API_KEY", "").strip()),
+        ("DASHSCOPE_API_KEY", os.getenv("DASHSCOPE_API_KEY", "").strip()),
+    ]
+    for name, value in candidates:
+        if value:
+            return value, name
+    return "", ""
+
+
+def _build_openai_compatible_client(config: dict, scene: str) -> OpenAI:
+    """
+    构建 OpenAI 兼容客户端（支持火山/通义等兼容端点）。
+    """
+    api_key, key_source = _resolve_openai_compatible_api_key()
+    if not api_key:
+        raise ValueError(
+            f"[{scene}] 缺少 API Key，请至少配置 OPENAI_API_KEY 或 VOLCENGINE_API_KEY"
+        )
+
+    base_url = str(config.get("backend_url") or "").strip()
+    if not base_url:
+        # 兼容火山方舟默认端点
+        base_url = str(
+            os.getenv("VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+        ).strip()
+
+    logger.info(f"🔎 [{scene}] OpenAI兼容客户端初始化: base_url={base_url}, key_source={key_source}")
+    return OpenAI(api_key=api_key, base_url=base_url)
+
+
+class WebSearchToolNotOpenError(RuntimeError):
+    """联网搜索插件未开通。"""
+
+
+def _get_attr_or_key(obj: Any, key: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def _is_tool_not_open_error(err: Exception) -> bool:
+    msg = str(err)
+    return (
+        "ToolNotOpen" in msg
+        or "not activated web search" in msg
+        or "联网内容插件" in msg
+    )
+
+
+def _looks_like_unavailable_search_text(text: str) -> bool:
+    t = str(text or "").strip()
+    if not t:
+        return True
+    patterns = [
+        "我目前无法",
+        "目前我无法",
+        "无法进行实时搜索",
+        "无法为您获取",
+        "无法直接搜索",
+        "无法搜索社交媒体",
+        "无法搜索",
+        "请您自行",
+        "建议您自行",
+        "尚未到来",
+        "还没有发生",
+        "未来时间段",
+        "无法回溯搜索特定历史日期",
+        "只能访问当前的实时信息",
+    ]
+    return any(p in t for p in patterns)
+
+
+def _extract_response_text(response: Any) -> str:
+    """兼容 responses/chat.completions 两种返回结构提取文本。"""
+    try:
+        text = _get_attr_or_key(response, "output_text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    except Exception:
+        pass
+
+    try:
+        output = _get_attr_or_key(response, "output") or []
+        if isinstance(output, list):
+            for item in output:
+                content = _get_attr_or_key(item, "content")
+                if isinstance(content, list):
+                    chunks: list[str] = []
+                    for c in content:
+                        t = _get_attr_or_key(c, "text")
+                        if isinstance(t, str) and t.strip():
+                            chunks.append(t.strip())
+                    if chunks:
+                        return "\n".join(chunks)
+    except Exception:
+        pass
+
+    try:
+        choices = _get_attr_or_key(response, "choices") or []
+        if isinstance(choices, list):
+            for choice in choices:
+                message = _get_attr_or_key(choice, "message") or {}
+                content = _get_attr_or_key(message, "content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                if isinstance(content, list):
+                    chunks: list[str] = []
+                    for c in content:
+                        t = _get_attr_or_key(c, "text")
+                        if isinstance(t, str) and t.strip():
+                            chunks.append(t.strip())
+                    if chunks:
+                        return "\n".join(chunks)
+    except Exception:
+        pass
+    return ""
+
+
+def _responses_create_with_web_search(
+    *,
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    scene: str,
+) -> Any:
+    """
+    兼容不同OpenAI网关的联网搜索工具类型。
+    依次尝试：
+    1) web_search_preview（OpenAI原生）
+    2) web_search（部分兼容网关）
+    """
+    base_url = str(getattr(client, "base_url", "") or "").lower()
+    is_volc = "volces.com" in base_url or "volcengine" in base_url or "ark.cn-beijing" in base_url
+
+    sources_env = os.getenv("VOLCENGINE_WEB_SEARCH_SOURCES", "").strip()
+    volc_sources: list[str] = []
+    if sources_env:
+        volc_sources = [x.strip() for x in sources_env.split(",") if x.strip()]
+
+    volc_tool = {"type": "web_search"}
+    if volc_sources:
+        volc_tool["sources"] = volc_sources
+
+    tool_candidates = (
+        [[volc_tool], [{
+            "type": "web_search_preview",
+            "user_location": {"type": "approximate"},
+            "search_context_size": "low",
+        }]]
+        if is_volc
+        else [[{
+            "type": "web_search_preview",
+            "user_location": {"type": "approximate"},
+            "search_context_size": "low",
+        }], [volc_tool]]
+    )
+    last_error: Optional[Exception] = None
+
+    for tools in tool_candidates:
+        tool_type = tools[0].get("type")
+        try:
+            logger.info(f"🔎 [{scene}] 尝试联网工具: {tool_type}")
+            return client.responses.create(
+                model=model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": prompt}],
+                    }
+                ],
+                text={"format": {"type": "text"}},
+                tools=tools,
+                temperature=1,
+                max_output_tokens=1200,
+                top_p=1,
+                store=True,
+            )
+        except Exception as e:
+            if _is_tool_not_open_error(e):
+                raise WebSearchToolNotOpenError(f"[{scene}] 联网搜索插件未开通: {e}") from e
+            last_error = e
+            logger.warning(f"⚠️ [{scene}] 联网工具 {tool_type} 调用失败: {e}")
+            continue
+
+    # 对部分兼容网关再尝试 chat.completions 形式
+    for tools in tool_candidates:
+        tool_type = tools[0].get("type")
+        try:
+            logger.info(f"🔎 [{scene}] 尝试 chat.completions 联网工具: {tool_type}")
+            return client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是财经研究助手。请基于联网搜索结果回答，并注明关键信息来源。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                tools=tools,
+                tool_choice="auto",
+                temperature=1,
+                max_tokens=900,
+                top_p=1,
+            )
+        except Exception as e:
+            if _is_tool_not_open_error(e):
+                raise WebSearchToolNotOpenError(f"[{scene}] 联网搜索插件未开通: {e}") from e
+            last_error = e
+            logger.warning(f"⚠️ [{scene}] chat.completions 联网工具 {tool_type} 调用失败: {e}")
+            continue
+
+    raise RuntimeError(f"[{scene}] 联网搜索工具不可用: {last_error}")
 
 
 def get_finnhub_news(
@@ -938,72 +1162,39 @@ def get_YFin_data(
 
 def get_stock_news_openai(ticker, curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["backend_url"])
-
-    response = client.responses.create(
+    client = _build_openai_compatible_client(config, scene="stock_news_openai")
+    response = _responses_create_with_web_search(
+        client=client,
         model=config["quick_think_llm"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"Can you search Social Media for {ticker} from 7 days before {curr_date} to {curr_date}? Make sure you only get the data posted during that period.",
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        reasoning={},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "low",
-            }
-        ],
-        temperature=1,
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
+        prompt=(
+            f"请使用联网搜索检索 {ticker} 在 {curr_date} 往前7天内的公开信息，优先财经新闻、公司公告、研报与权威媒体报道。"
+            "若社交媒体不可得，请不要返回“无法搜索”，改为提供可获取的新闻来源。"
+            "请按时间列点输出：日期、标题、来源、核心影响。"
+        ),
+        scene="stock_news_openai",
     )
-
-    return response.output[1].content[0].text
+    text = _extract_response_text(response)
+    if _looks_like_unavailable_search_text(text):
+        raise RuntimeError("[stock_news_openai] 联网模型未返回有效新闻结果")
+    return text
 
 
 def get_global_news_openai(curr_date):
     config = get_config()
-    client = OpenAI(base_url=config["backend_url"])
-
-    response = client.responses.create(
+    client = _build_openai_compatible_client(config, scene="global_news_openai")
+    response = _responses_create_with_web_search(
+        client=client,
         model=config["quick_think_llm"],
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"Can you search global or macroeconomics news from 7 days before {curr_date} to {curr_date} that would be informative for trading purposes? Make sure you only get the data posted during that period.",
-                    }
-                ],
-            }
-        ],
-        text={"format": {"type": "text"}},
-        reasoning={},
-        tools=[
-            {
-                "type": "web_search_preview",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "low",
-            }
-        ],
-        temperature=1,
-        max_output_tokens=4096,
-        top_p=1,
-        store=True,
+        prompt=(
+            f"Can you search global or macroeconomics news from 7 days before {curr_date} to {curr_date} "
+            "that would be informative for trading purposes? Make sure you only get the data posted during that period."
+        ),
+        scene="global_news_openai",
     )
-
-    return response.output[1].content[0].text
+    text = _extract_response_text(response)
+    if _looks_like_unavailable_search_text(text):
+        raise RuntimeError("[global_news_openai] 联网模型未返回有效宏观新闻结果")
+    return text
 
 
 def get_fundamentals_finnhub(ticker, curr_date):
@@ -1220,15 +1411,13 @@ def get_fundamentals_openai(ticker, curr_date):
 
         # 🔥 特殊处理：OpenAI（如果配置了）
         config = get_config()
-        openai_api_key = os.getenv("OPENAI_API_KEY")
+        openai_api_key, _ = _resolve_openai_compatible_api_key()
         if openai_api_key and config.get("backend_url") and config.get("quick_think_llm"):
-            backend_url = config.get("backend_url", "")
-            if "openai.com" in backend_url:
-                try:
-                    logger.info(f"📊 [OpenAI] 尝试使用 OpenAI 获取基本面数据...")
-                    return _get_fundamentals_openai_impl(ticker, curr_date, config, cache)
-                except Exception as e:
-                    logger.warning(f"⚠️ [OpenAI] 获取失败: {e}")
+            try:
+                logger.info("📊 [OpenAI兼容] 尝试使用联网模型获取基本面数据...")
+                return _get_fundamentals_openai_impl(ticker, curr_date, config, cache)
+            except Exception as e:
+                logger.warning(f"⚠️ [OpenAI兼容] 获取失败: {e}")
 
         # 所有数据源都失败
         logger.error(f"❌ [美股基本面] 所有数据源都失败: {ticker}")
@@ -1360,37 +1549,19 @@ def _get_fundamentals_openai_impl(ticker, curr_date, config, cache):
     try:
         logger.debug(f"📊 [OpenAI] 尝试使用OpenAI获取 {ticker} 的基本面数据...")
 
-        client = OpenAI(base_url=config["backend_url"])
+        client = _build_openai_compatible_client(config, scene="fundamentals_openai")
 
-        response = client.responses.create(
+        response = _responses_create_with_web_search(
+            client=client,
             model=config["quick_think_llm"],
-            input=[
-                {
-                    "role": "system",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": f"Can you search Fundamental for discussions on {ticker} during of the month before {curr_date} to the month of {curr_date}. Make sure you only get the data posted during that period. List as a table, with PE/PS/Cash flow/ etc",
-                        }
-                    ],
-                }
-            ],
-            text={"format": {"type": "text"}},
-            reasoning={},
-            tools=[
-                {
-                    "type": "web_search_preview",
-                    "user_location": {"type": "approximate"},
-                    "search_context_size": "low",
-                }
-            ],
-            temperature=1,
-            max_output_tokens=4096,
-            top_p=1,
-            store=True,
+            prompt=(
+                f"Can you search Fundamental for discussions on {ticker} during of the month before {curr_date} "
+                f"to the month of {curr_date}. Make sure you only get the data posted during that period. "
+                "List as a table, with PE/PS/Cash flow/ etc"
+            ),
+            scene="fundamentals_openai",
         )
-
-        result = response.output[1].content[0].text
+        result = _extract_response_text(response)
 
         # 保存到缓存
         if result and len(result) > 100:  # 只有当结果有实际内容时才缓存

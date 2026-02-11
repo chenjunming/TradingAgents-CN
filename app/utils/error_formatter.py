@@ -36,6 +36,7 @@ class ErrorFormatter:
         "google": "Google Gemini",
         "dashscope": "阿里百炼（通义千问）",
         "qianfan": "百度千帆",
+        "volcengine": "火山引擎（ARK）",
         "deepseek": "DeepSeek",
         "openai": "OpenAI",
         "openrouter": "OpenRouter",
@@ -94,7 +95,7 @@ class ErrorFormatter:
         
         if llm_provider or any(keyword in error_lower for keyword in [
             "api key", "api_key", "apikey", "invalid_api_key", "authentication", 
-            "unauthorized", "401", "403", "gemini", "openai", "dashscope", "qianfan"
+            "unauthorized", "401", "403", "gemini", "openai", "dashscope", "qianfan", "volcengine", "ark"
         ]):
             # LLM API Key 错误
             if any(keyword in error_lower for keyword in [
@@ -405,4 +406,3 @@ class ErrorFormatter:
                 ),
                 "technical_detail": original_error
             }
-

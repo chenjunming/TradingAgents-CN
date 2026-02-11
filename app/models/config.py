@@ -29,6 +29,7 @@ class ModelProvider(str, Enum):
     OPENROUTER = "openrouter"
     CUSTOM_OPENAI = "custom_openai"
     QIANFAN = "qianfan"
+    VOLCENGINE = "volcengine"
     LOCAL = "local"
 
     # 🆕 聚合渠道
@@ -157,6 +158,7 @@ class DataSourceType(str, Enum):
     TUSHARE = "tushare"
     AKSHARE = "akshare"
     BAOSTOCK = "baostock"
+    LONGPORT = "longport"
 
     # 美股数据源
     FINNHUB = "finnhub"

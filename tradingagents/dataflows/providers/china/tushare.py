@@ -7,6 +7,7 @@ from datetime import datetime, date, timedelta
 import pandas as pd
 import asyncio
 import logging
+import os
 
 from ..base_provider import BaseStockDataProvider
 from tradingagents.config.providers_config import get_provider_config
@@ -85,6 +86,21 @@ class TushareProvider(BaseStockDataProvider):
 
         return None
 
+    def _get_http_url(self) -> str:
+        url = str(self.config.get("http_url", "") or os.getenv("TUSHARE_HTTP_URL", "")).strip()
+        return url.rstrip("/")
+
+    def _create_pro_api(self, token: str):
+        ts.set_token(token)
+        timeout = int(self.config.get("timeout", 30) or 30)
+        api = ts.pro_api(token=token, timeout=timeout)
+        http_url = self._get_http_url()
+        if http_url:
+            # tushare 1.4.x 的 DataApi 不暴露 http_url 参数，需覆写私有属性
+            setattr(api, "_DataApi__http_url", http_url)
+            self.logger.info(f"🔗 Tushare HTTP URL 使用自定义地址: {http_url}")
+        return api
+
     def connect_sync(self) -> bool:
         """同步连接到Tushare"""
         if not TUSHARE_AVAILABLE:
@@ -114,8 +130,7 @@ class TushareProvider(BaseStockDataProvider):
             if db_token:
                 try:
                     self.logger.info(f"🔄 [步骤3] 尝试使用数据库中的 Tushare Token (超时: {test_timeout}秒)...")
-                    ts.set_token(db_token)
-                    self.api = ts.pro_api()
+                    self.api = self._create_pro_api(db_token)
 
                     # 测试连接 - 直接调用同步方法（不使用 asyncio.run）
                     try:
@@ -140,8 +155,7 @@ class TushareProvider(BaseStockDataProvider):
             if env_token:
                 try:
                     self.logger.info(f"🔄 [步骤4] 尝试使用 .env 中的 Tushare Token (超时: {test_timeout}秒)...")
-                    ts.set_token(env_token)
-                    self.api = ts.pro_api()
+                    self.api = self._create_pro_api(env_token)
 
                     # 测试连接 - 直接调用同步方法（不使用 asyncio.run）
                     try:
@@ -190,8 +204,7 @@ class TushareProvider(BaseStockDataProvider):
             if db_token:
                 try:
                     self.logger.info(f"🔄 尝试使用数据库中的 Tushare Token (超时: {test_timeout}秒)...")
-                    ts.set_token(db_token)
-                    self.api = ts.pro_api()
+                    self.api = self._create_pro_api(db_token)
 
                     # 测试连接（异步）- 使用超时
                     try:
@@ -220,8 +233,7 @@ class TushareProvider(BaseStockDataProvider):
             if env_token:
                 try:
                     self.logger.info(f"🔄 尝试使用 .env 中的 Tushare Token (超时: {test_timeout}秒)...")
-                    ts.set_token(env_token)
-                    self.api = ts.pro_api()
+                    self.api = self._create_pro_api(env_token)
 
                     # 测试连接（异步）- 使用超时
                     try:

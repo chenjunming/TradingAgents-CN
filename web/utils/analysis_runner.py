@@ -330,6 +330,16 @@ def run_stock_analysis(stock_symbol, analysis_date, analysts, research_depth, ll
             
             logger.info(f"🤖 [千帆] 快速模型: {config['quick_think_llm']}")
             logger.info(f"🤖 [千帆] 深度模型: {config['deep_think_llm']}")
+        elif llm_provider == "volcengine":
+            # 火山引擎方舟（ARK）OpenAI兼容配置
+            config["backend_url"] = "https://ark.cn-beijing.volces.com/api/v3"
+            if not config.get("quick_think_llm"):
+                config["quick_think_llm"] = "ep-your-endpoint-id"
+            if not config.get("deep_think_llm"):
+                config["deep_think_llm"] = "ep-your-endpoint-id"
+            logger.info(f"🌋 [火山引擎] 快速模型: {config['quick_think_llm']}")
+            logger.info(f"🌋 [火山引擎] 深度模型: {config['deep_think_llm']}")
+            logger.info(f"🌋 [火山引擎] API端点: {config['backend_url']}")
         elif llm_provider == "google":
             # Google AI不需要backend_url，使用默认的OpenAI格式
             config["backend_url"] = "https://api.openai.com/v1"

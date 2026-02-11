@@ -6,7 +6,7 @@
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 
 logger = logging.getLogger(__name__)
@@ -447,7 +447,15 @@ class UnifiedNewsAnalyzer:
             if hasattr(self.toolkit, 'get_finnhub_news'):
                 logger.info(f"[统一新闻工具] 尝试FinnHub美股新闻...")
                 # 使用LangChain工具的正确调用方式：.invoke()方法和字典参数
-                result = self.toolkit.get_finnhub_news.invoke({"symbol": stock_code, "max_results": min(max_news, 50)})
+                end_date = curr_date
+                start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+                result = self.toolkit.get_finnhub_news.invoke(
+                    {
+                        "ticker": stock_code,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                    }
+                )
                 if result and len(result.strip()) > 50:
                     logger.info(f"[统一新闻工具] ✅ FinnHub美股新闻获取成功: {len(result)} 字符")
                     return self._format_news_result(result, "FinnHub美股新闻", model_info)

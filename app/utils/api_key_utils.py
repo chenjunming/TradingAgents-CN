@@ -101,6 +101,7 @@ def get_env_api_key_for_datasource(ds_type: str) -> Optional[str]:
     数据源类型到环境变量名的映射：
     - tushare → TUSHARE_TOKEN
     - finnhub → FINNHUB_API_KEY
+    - longport → LONGPORT_APP_KEY
     - polygon → POLYGON_API_KEY
     - iex → IEX_API_KEY
     - quandl → QUANDL_API_KEY
@@ -116,6 +117,7 @@ def get_env_api_key_for_datasource(ds_type: str) -> Optional[str]:
     env_key_map = {
         "tushare": "TUSHARE_TOKEN",
         "finnhub": "FINNHUB_API_KEY",
+        "longport": "LONGPORT_APP_KEY",
         "polygon": "POLYGON_API_KEY",
         "iex": "IEX_API_KEY",
         "quandl": "QUANDL_API_KEY",
@@ -162,4 +164,3 @@ def should_skip_api_key_update(api_key: Optional[str]) -> bool:
         return True
     
     return False
-

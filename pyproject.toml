@@ -32,6 +32,7 @@ dependencies = [
     # HTTP客户端和SSE
     "httpx>=0.24.0",
     "sse-starlette>=1.0.0",
+    "exchange-calendars>=4.5.0",
 
     # 日志处理
     "concurrent-log-handler>=0.9.24",  # Windows 友好的日志轮转处理器
@@ -42,6 +43,7 @@ dependencies = [
     "baostock>=0.8.8",
     "eodhd>=1.0.32",
     "finnhub-python>=2.4.23",
+    "longport>=2.1.12",
     "tushare>=1.4.21",
     "yfinance>=0.2.63",
     "stockstats>=0.6.5",
@@ -55,6 +57,7 @@ dependencies = [
     "langchain-google-genai>=2.1.12",  # 修复 client_options 未定义错误
     "langchain-openai>=0.3.23",
     "langgraph>=0.4.8",
+    "lark-oapi>=1.4.22",
     "openai>=1.0.0,<2.0.0",
 
     # 数据处理和分析

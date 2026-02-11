@@ -1429,6 +1429,17 @@ class DataSourceManager:
         """
         logger.info(f"📊 [数据来源: {self.current_source.value}] 开始获取股票信息: {symbol}")
 
+        # 非A股优先走专用通道，避免误走A股数据源链路导致噪音错误日志
+        try:
+            from tradingagents.utils.stock_utils import StockUtils, StockMarket
+            market = StockUtils.identify_stock_market(symbol)
+            if market == StockMarket.HONG_KONG:
+                return self._get_hk_stock_info(symbol)
+            if market == StockMarket.US:
+                return self._get_us_stock_info(symbol)
+        except Exception as e:
+            logger.debug(f"⚠️ [股票信息] 市场识别失败，继续按A股链路处理: {e}")
+
         # 优先使用 App Mongo 缓存（当 ta_use_app_cache=True）
         try:
             from tradingagents.config.runtime_settings import use_app_cache_enabled  # type: ignore
@@ -1597,17 +1608,29 @@ class DataSourceManager:
         """尝试使用备用数据源获取股票基本信息"""
         logger.error(f"🔄 {self.current_source.value}失败，尝试备用数据源获取股票信息...")
 
+        # 非A股直接走专用兜底，避免调用A股数据源
+        try:
+            from tradingagents.utils.stock_utils import StockUtils, StockMarket
+            market = StockUtils.identify_stock_market(symbol)
+            if market == StockMarket.HONG_KONG:
+                return self._get_hk_stock_info(symbol)
+            if market == StockMarket.US:
+                return self._get_us_stock_info(symbol)
+        except Exception as e:
+            logger.debug(f"⚠️ [股票信息降级] 市场识别失败，继续A股备用数据源: {e}")
+
         # 获取所有可用数据源
         available_sources = self.available_sources.copy()
 
         # 移除当前数据源
-        if self.current_source.value in available_sources:
-            available_sources.remove(self.current_source.value)
+        if self.current_source in available_sources:
+            available_sources.remove(self.current_source)
 
         # 尝试所有备用数据源
-        for source_name in available_sources:
+        for source_enum in available_sources:
             try:
-                source = ChinaDataSource(source_name)
+                source = source_enum
+                source_name = source.value
                 logger.info(f"🔄 尝试备用数据源获取股票信息: {source_name}")
 
                 # 根据数据源类型获取股票信息
@@ -1646,6 +1669,24 @@ class DataSourceManager:
         logger.error(f"❌ 所有数据源都无法获取{symbol}的股票信息")
         return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'unknown'}
 
+    def _get_tushare_stock_info(self, symbol: str) -> Dict:
+        """使用Tushare获取A股基本信息"""
+        try:
+            from tradingagents.utils.stock_utils import StockUtils, StockMarket
+            if StockUtils.identify_stock_market(symbol) != StockMarket.CHINA_A:
+                return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'tushare'}
+
+            from .interface import get_china_stock_info_tushare
+            info_str = get_china_stock_info_tushare(symbol)
+            parsed = self._parse_stock_info_string(info_str, symbol)
+            parsed['source'] = 'tushare'
+            if not parsed.get('name'):
+                parsed['name'] = f'股票{symbol}'
+            return parsed
+        except Exception as e:
+            logger.error(f"❌ [股票信息] Tushare获取失败: {symbol}, 错误: {e}")
+            return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'tushare', 'error': str(e)}
+
     def _get_akshare_stock_info(self, symbol: str) -> Dict:
         """使用AKShare获取股票基本信息
 
@@ -1654,6 +1695,11 @@ class DataSourceManager:
         - 对于股票，需要使用完整代码（如 sz000001 或 sh600000）
         """
         try:
+            from tradingagents.utils.stock_utils import StockUtils, StockMarket
+            if StockUtils.identify_stock_market(symbol) != StockMarket.CHINA_A:
+                # 非A股不走该接口，避免 AKShare 参数格式异常
+                return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare'}
+
             import akshare as ak
 
             # 🔥 转换为 AKShare 格式的股票代码
@@ -1704,6 +1750,60 @@ class DataSourceManager:
         except Exception as e:
             logger.error(f"❌ [股票信息] AKShare获取失败: {symbol}, 错误: {e}")
             return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'akshare', 'error': str(e)}
+
+    def _get_hk_stock_info(self, symbol: str) -> Dict:
+        """使用港股统一接口获取股票基本信息"""
+        try:
+            from .interface import get_hk_stock_info_unified
+
+            s = str(symbol or "").strip().upper()
+            if s.endswith(".HK"):
+                digits = s[:-3]
+                if digits.isdigit():
+                    s = f"{digits.zfill(5)}.HK"
+            elif s.isdigit() and 4 <= len(s) <= 5:
+                s = f"{s.zfill(5)}.HK"
+
+            info = get_hk_stock_info_unified(s)
+            if isinstance(info, dict):
+                name = str(info.get('name') or '').strip() or f'港股{s}'
+                return {
+                    'symbol': s,
+                    'name': name,
+                    'area': str(info.get('area') or '香港'),
+                    'industry': str(info.get('industry') or '未知'),
+                    'market': '港股',
+                    'list_date': str(info.get('list_date') or '未知'),
+                    'source': str(info.get('source') or 'hk_unified'),
+                }
+            return {'symbol': s, 'name': f'港股{s}', 'source': 'hk_unified'}
+        except Exception as e:
+            logger.error(f"❌ [股票信息] 港股信息获取失败: {symbol}, 错误: {e}")
+            s = str(symbol or "").strip().upper()
+            return {'symbol': s, 'name': f'港股{s}', 'source': 'hk_unified', 'error': str(e)}
+
+    def _get_us_stock_info(self, symbol: str) -> Dict:
+        """使用美股统一接口（YFinance）获取股票基本信息"""
+        try:
+            from .providers.us.yfinance import YFinanceUtils
+            s = str(symbol or "").strip().upper()
+            info = YFinanceUtils.get_stock_info(s)
+            if isinstance(info, dict):
+                name = str(info.get('shortName') or info.get('longName') or '').strip() or f'美股{s}'
+                return {
+                    'symbol': s,
+                    'name': name,
+                    'area': str(info.get('country') or '美国'),
+                    'industry': str(info.get('industry') or info.get('sector') or '未知'),
+                    'market': '美股',
+                    'list_date': str(info.get('ipoExpectedDate') or '未知'),
+                    'source': 'yfinance',
+                }
+            return {'symbol': s, 'name': f'美股{s}', 'source': 'yfinance'}
+        except Exception as e:
+            logger.error(f"❌ [股票信息] 美股信息获取失败: {symbol}, 错误: {e}")
+            s = str(symbol or "").strip().upper()
+            return {'symbol': s, 'name': f'美股{s}', 'source': 'yfinance', 'error': str(e)}
 
     def _get_baostock_stock_info(self, symbol: str) -> Dict:
         """使用BaoStock获取股票基本信息"""

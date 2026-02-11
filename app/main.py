@@ -34,6 +34,10 @@ from app.routers import stocks as stocks_router
 from app.routers import stock_data as stock_data_router
 from app.routers import stock_sync as stock_sync_router
 from app.routers import multi_market_stocks as multi_market_stocks_router
+from app.routers import advisor as advisor_router
+from app.routers import feishu_bot as feishu_bot_router
+from app.routers import portfolio as portfolio_router
+from app.routers import a_share_sqlite as a_share_sqlite_router
 from app.routers import notifications as notifications_router
 from app.routers import websocket_notifications as websocket_notifications_router
 from app.routers import scheduler as scheduler_router
@@ -60,14 +64,26 @@ from app.worker.baostock_sync_service import (
     run_baostock_historical_sync,
     run_baostock_status_check
 )
-# 港股和美股改为按需获取+缓存模式，不再需要定时同步任务
-# from app.worker.hk_sync_service import ...
-# from app.worker.us_sync_service import ...
+from app.worker.hk_sync_service import (
+    run_hk_stock_universe_sync,
+    run_hk_akshare_basic_info_sync,
+    run_hk_akshare_quotes_sync,
+    run_hk_status_check,
+)
+from app.worker.us_sync_service import (
+    run_us_stock_universe_sync,
+    run_us_yfinance_basic_info_sync,
+    run_us_yfinance_quotes_sync,
+    run_us_status_check,
+)
 from app.middleware.operation_log_middleware import OperationLogMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from app.services.quotes_ingestion_service import QuotesIngestionService
+from app.services.market_push_schedule_service import market_push_schedule_service
+from app.services.feishu_stream_service import feishu_stream_service
+from app.services.simple_analysis_service import get_simple_analysis_service
 from app.routers import paper as paper_router
 
 
@@ -267,6 +283,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Startup backfill failed (ignored): {e}")
 
+    # 启动飞书 stream 模式监听（按环境变量开关）
+    await feishu_stream_service.start()
+
     # 启动每日定时任务：可配置
     scheduler: AsyncIOScheduler | None = None
     try:
@@ -292,11 +311,28 @@ async def lifespan(app: FastAPI):
             preferred_sources = ["akshare", "baostock"]
             logger.info(f"📊 股票基础信息同步优先数据源: AKShare > BaoStock (Tushare已禁用)")
 
-        # 立即在启动后尝试一次（不阻塞）
+        # 可选：启动后立即同步一次（默认关闭，避免每次启动批量更新）
         async def run_sync_with_sources():
+            try:
+                db = get_mongo_db()
+                current_count = await db.stock_basic_info.count_documents({})
+                min_count = int(getattr(settings, "SYNC_STOCK_BASICS_INIT_MIN_COUNT", 4000))
+                if current_count >= min_count:
+                    logger.info(
+                        "⏭️ stock_basic_info 数据量已足够（%s >= %s），跳过启动即同步",
+                        current_count,
+                        min_count,
+                    )
+                    return
+            except Exception as e:
+                logger.warning(f"启动前初始化检查失败，继续执行同步: {e}")
             await multi_source_service.run_full_sync(force=False, preferred_sources=preferred_sources)
 
-        asyncio.create_task(run_sync_with_sources())
+        if settings.SYNC_STOCK_BASICS_RUN_ON_STARTUP:
+            asyncio.create_task(run_sync_with_sources())
+            logger.info("🚀 已启用启动即同步基础信息")
+        else:
+            logger.info("⏭️ 已跳过启动即同步基础信息（SYNC_STOCK_BASICS_RUN_ON_STARTUP=false）")
 
         # 配置调度：优先使用 CRON，其次使用 HH:MM
         if settings.SYNC_STOCK_BASICS_ENABLED:
@@ -553,9 +589,149 @@ async def lifespan(app: FastAPI):
                 logger.error(f"❌ 新闻同步失败: {e}", exc_info=True)
 
         # ==================== 港股/美股数据配置 ====================
-        # 港股和美股采用按需获取+缓存模式，不再配置定时同步任务
-        logger.info("🇭🇰 港股数据采用按需获取+缓存模式")
-        logger.info("🇺🇸 美股数据采用按需获取+缓存模式")
+        logger.info("🔄 配置港股全量股票池 + 定期增量同步任务...")
+
+        # 港股股票池全量同步（每日）
+        scheduler.add_job(
+            run_hk_stock_universe_sync,
+            CronTrigger.from_crontab(settings.HK_UNIVERSE_SYNC_CRON, timezone=settings.TIMEZONE),
+            id="hk_stock_universe_sync",
+            name="港股股票池全量同步",
+            kwargs={"force_update": False},
+        )
+        if not settings.HK_UNIVERSE_SYNC_ENABLED:
+            scheduler.pause_job("hk_stock_universe_sync")
+            logger.info(f"⏸️ 港股股票池同步已添加但暂停: {settings.HK_UNIVERSE_SYNC_CRON}")
+        else:
+            logger.info(f"📦 港股股票池同步已配置: {settings.HK_UNIVERSE_SYNC_CRON}")
+
+        # 港股基础信息增量同步（AKShare）
+        scheduler.add_job(
+            run_hk_akshare_basic_info_sync,
+            CronTrigger.from_crontab(settings.HK_BASIC_INFO_SYNC_CRON, timezone=settings.TIMEZONE),
+            id="hk_akshare_basic_info_sync",
+            name="港股基础信息增量同步（AKShare）",
+            kwargs={
+                "force_update": False,
+                "max_symbols": settings.HK_BASIC_INFO_INCREMENTAL_BATCH_SIZE,
+            },
+        )
+        if not settings.HK_BASIC_INFO_SYNC_ENABLED:
+            scheduler.pause_job("hk_akshare_basic_info_sync")
+            logger.info(f"⏸️ 港股基础信息同步已添加但暂停: {settings.HK_BASIC_INFO_SYNC_CRON}")
+        else:
+            logger.info(
+                f"📊 港股基础信息增量同步已配置: {settings.HK_BASIC_INFO_SYNC_CRON}, "
+                f"batch={settings.HK_BASIC_INFO_INCREMENTAL_BATCH_SIZE}"
+            )
+
+        # 港股行情增量同步（AKShare + Longport补齐）
+        scheduler.add_job(
+            run_hk_akshare_quotes_sync,
+            CronTrigger.from_crontab(settings.HK_QUOTES_SYNC_CRON, timezone=settings.TIMEZONE),
+            id="hk_akshare_quotes_sync",
+            name="港股行情增量同步（AKShare）",
+            kwargs={"max_symbols": settings.HK_QUOTES_INCREMENTAL_BATCH_SIZE},
+        )
+        if not settings.HK_QUOTES_SYNC_ENABLED:
+            scheduler.pause_job("hk_akshare_quotes_sync")
+            logger.info(f"⏸️ 港股行情同步已添加但暂停: {settings.HK_QUOTES_SYNC_CRON}")
+        else:
+            logger.info(
+                f"📈 港股行情增量同步已配置: {settings.HK_QUOTES_SYNC_CRON}, "
+                f"batch={settings.HK_QUOTES_INCREMENTAL_BATCH_SIZE}"
+            )
+
+        # 港股状态检查
+        scheduler.add_job(
+            run_hk_status_check,
+            CronTrigger.from_crontab(settings.HK_STATUS_CHECK_CRON, timezone=settings.TIMEZONE),
+            id="hk_status_check",
+            name="港股同步状态检查",
+        )
+        if not settings.HK_STATUS_CHECK_ENABLED:
+            scheduler.pause_job("hk_status_check")
+            logger.info(f"⏸️ 港股状态检查已添加但暂停: {settings.HK_STATUS_CHECK_CRON}")
+        else:
+            logger.info(f"🔍 港股状态检查已配置: {settings.HK_STATUS_CHECK_CRON}")
+
+        if settings.HK_UNIVERSE_RUN_ON_STARTUP:
+            asyncio.create_task(run_hk_stock_universe_sync(force_update=False))
+            logger.info("🚀 启动时执行一次港股股票池同步")
+        else:
+            logger.info("⏭️ 已跳过启动时港股股票池同步（HK_UNIVERSE_RUN_ON_STARTUP=false）")
+
+        logger.info("🔄 配置美股全量股票池 + 定期增量同步任务...")
+
+        # 美股股票池全量同步（每日）
+        scheduler.add_job(
+            run_us_stock_universe_sync,
+            CronTrigger.from_crontab(settings.US_UNIVERSE_SYNC_CRON, timezone=settings.TIMEZONE),
+            id="us_stock_universe_sync",
+            name="美股股票池全量同步",
+            kwargs={"force_update": False},
+        )
+        if not settings.US_UNIVERSE_SYNC_ENABLED:
+            scheduler.pause_job("us_stock_universe_sync")
+            logger.info(f"⏸️ 美股股票池同步已添加但暂停: {settings.US_UNIVERSE_SYNC_CRON}")
+        else:
+            logger.info(f"📦 美股股票池同步已配置: {settings.US_UNIVERSE_SYNC_CRON}")
+
+        # 美股基础信息增量同步
+        scheduler.add_job(
+            run_us_yfinance_basic_info_sync,
+            CronTrigger.from_crontab(settings.US_BASIC_INFO_SYNC_CRON, timezone=settings.TIMEZONE),
+            id="us_yfinance_basic_info_sync",
+            name="美股基础信息增量同步（yfinance）",
+            kwargs={
+                "force_update": False,
+                "max_symbols": settings.US_BASIC_INFO_INCREMENTAL_BATCH_SIZE,
+            },
+        )
+        if not settings.US_BASIC_INFO_SYNC_ENABLED:
+            scheduler.pause_job("us_yfinance_basic_info_sync")
+            logger.info(f"⏸️ 美股基础信息同步已添加但暂停: {settings.US_BASIC_INFO_SYNC_CRON}")
+        else:
+            logger.info(
+                f"📊 美股基础信息增量同步已配置: {settings.US_BASIC_INFO_SYNC_CRON}, "
+                f"batch={settings.US_BASIC_INFO_INCREMENTAL_BATCH_SIZE}"
+            )
+
+        # 美股行情增量同步
+        scheduler.add_job(
+            run_us_yfinance_quotes_sync,
+            CronTrigger.from_crontab(settings.US_QUOTES_SYNC_CRON, timezone=settings.TIMEZONE),
+            id="us_yfinance_quotes_sync",
+            name="美股行情增量同步（yfinance）",
+            kwargs={"max_symbols": settings.US_QUOTES_INCREMENTAL_BATCH_SIZE},
+        )
+        if not settings.US_QUOTES_SYNC_ENABLED:
+            scheduler.pause_job("us_yfinance_quotes_sync")
+            logger.info(f"⏸️ 美股行情同步已添加但暂停: {settings.US_QUOTES_SYNC_CRON}")
+        else:
+            logger.info(
+                f"📈 美股行情增量同步已配置: {settings.US_QUOTES_SYNC_CRON}, "
+                f"batch={settings.US_QUOTES_INCREMENTAL_BATCH_SIZE}"
+            )
+
+        # 美股状态检查
+        scheduler.add_job(
+            run_us_status_check,
+            CronTrigger.from_crontab(settings.US_STATUS_CHECK_CRON, timezone=settings.TIMEZONE),
+            id="us_status_check",
+            name="美股同步状态检查",
+        )
+        if not settings.US_STATUS_CHECK_ENABLED:
+            scheduler.pause_job("us_status_check")
+            logger.info(f"⏸️ 美股状态检查已添加但暂停: {settings.US_STATUS_CHECK_CRON}")
+        else:
+            logger.info(f"🔍 美股状态检查已配置: {settings.US_STATUS_CHECK_CRON}")
+
+        if settings.US_UNIVERSE_RUN_ON_STARTUP:
+            asyncio.create_task(run_us_stock_universe_sync(force_update=False))
+            logger.info("🚀 启动时执行一次美股股票池同步")
+        else:
+            logger.info("⏭️ 已跳过启动时美股股票池同步（US_UNIVERSE_RUN_ON_STARTUP=false）")
 
         scheduler.add_job(
             run_news_sync,
@@ -568,6 +744,67 @@ async def lifespan(app: FastAPI):
             logger.info(f"⏸️ 新闻数据同步已添加但暂停: {settings.NEWS_SYNC_CRON}")
         else:
             logger.info(f"📰 新闻数据同步已配置（仅自选股）: {settings.NEWS_SYNC_CRON}")
+
+        # 个人投研助手：分市场推送扫描任务（每分钟）
+        async def run_market_push_scan():
+            try:
+                await market_push_schedule_service.scan_and_dispatch(user_id="default")
+            except Exception as e:
+                logger.error(f"❌ 分市场推送扫描失败: {e}", exc_info=True)
+
+        scheduler.add_job(
+            run_market_push_scan,
+            IntervalTrigger(seconds=settings.MARKET_PUSH_SCAN_INTERVAL_SECONDS, timezone=settings.TIMEZONE),
+            id="market_timed_push_dispatcher",
+            name="分市场投研推送扫描器"
+        )
+        if not settings.MARKET_PUSH_ENABLED:
+            scheduler.pause_job("market_timed_push_dispatcher")
+            logger.info("⏸️ 分市场投研推送扫描器已添加但暂停")
+        else:
+            logger.info(
+                f"🕒 分市场投研推送扫描器已启动: 每{settings.MARKET_PUSH_SCAN_INTERVAL_SECONDS}秒扫描"
+            )
+
+        # 分析任务僵尸清理任务（长时间 running/pending 自动失败）
+        async def run_analysis_zombie_cleanup():
+            try:
+                service = get_simple_analysis_service()
+                result = await service.cleanup_zombie_tasks(
+                    max_running_hours=settings.ANALYSIS_ZOMBIE_MAX_RUNNING_HOURS
+                )
+                cleaned = int(result.get("total_cleaned", 0))
+                if cleaned > 0:
+                    logger.warning(
+                        "🧹 已清理分析僵尸任务: total=%s (memory=%s, mongo=%s, max_running_hours=%s)",
+                        cleaned,
+                        result.get("memory_cleaned", 0),
+                        result.get("mongo_cleaned", 0),
+                        settings.ANALYSIS_ZOMBIE_MAX_RUNNING_HOURS,
+                    )
+            except Exception as e:
+                logger.error(f"❌ 分析僵尸任务清理失败: {e}", exc_info=True)
+
+        scheduler.add_job(
+            run_analysis_zombie_cleanup,
+            IntervalTrigger(
+                minutes=settings.ANALYSIS_ZOMBIE_CLEANUP_INTERVAL_MINUTES,
+                timezone=settings.TIMEZONE,
+            ),
+            id="analysis_zombie_cleanup",
+            name="分析僵尸任务清理器",
+        )
+        if not settings.ANALYSIS_ZOMBIE_CLEANUP_ENABLED:
+            scheduler.pause_job("analysis_zombie_cleanup")
+            logger.info("⏸️ 分析僵尸任务清理器已添加但暂停")
+        else:
+            logger.info(
+                f"🧹 分析僵尸任务清理器已启动: 每{settings.ANALYSIS_ZOMBIE_CLEANUP_INTERVAL_MINUTES}分钟扫描, "
+                f"超时阈值={settings.ANALYSIS_ZOMBIE_MAX_RUNNING_HOURS}小时"
+            )
+            if settings.ANALYSIS_ZOMBIE_CLEANUP_RUN_ON_STARTUP:
+                asyncio.create_task(run_analysis_zombie_cleanup())
+                logger.info("🚀 启动时执行一次分析僵尸任务清理")
 
         scheduler.start()
 
@@ -582,6 +819,11 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # 关闭时清理
+        try:
+            await feishu_stream_service.stop()
+        except Exception as e:
+            logger.warning(f"Feishu stream listener cleanup error: {e}")
+
         if scheduler:
             try:
                 scheduler.shutdown(wait=False)
@@ -728,6 +970,10 @@ app.include_router(financial_data.router, tags=["financial-data"])
 app.include_router(news_data.router, tags=["news-data"])
 app.include_router(social_media.router, tags=["social-media"])
 app.include_router(internal_messages.router, tags=["internal-messages"])
+app.include_router(advisor_router.router, tags=["advisor"])
+app.include_router(feishu_bot_router.router, tags=["feishu"])
+app.include_router(portfolio_router.router, tags=["portfolio"])
+app.include_router(a_share_sqlite_router.router, tags=["a-share-sqlite"])
 
 
 @app.get("/")

@@ -31,6 +31,7 @@ class DataSourceCode(str, Enum):
     TUSHARE = "tushare"      # Tushare - 专业A股数据
     AKSHARE = "akshare"      # AKShare - 开源金融数据（A股+港股）
     BAOSTOCK = "baostock"    # BaoStock - 免费A股数据
+    LONGPORT = "longport"    # Longport - 长桥 OpenAPI（港美股/A股实时行情）
     
     # ==================== 美股数据源 ====================
     YFINANCE = "yfinance"         # yfinance - Yahoo Finance Python库
@@ -130,6 +131,21 @@ DATA_SOURCE_REGISTRY: Dict[str, DataSourceInfo] = {
         official_website="http://baostock.com",
         documentation_url="http://baostock.com/baostock/index.php/Python_API%E6%96%87%E6%A1%A3",
         features=["历史行情", "财务数据", "完全免费", "数据稳定"],
+    ),
+
+    # Longport (长桥)
+    DataSourceCode.LONGPORT: DataSourceInfo(
+        code=DataSourceCode.LONGPORT,
+        name="Longport",
+        display_name="Longport (长桥)",
+        provider="Longbridge",
+        description="长桥 OpenAPI，支持港股/美股/A股实时行情与市场数据",
+        supported_markets=["a_shares", "hk_stocks", "us_stocks"],
+        requires_api_key=True,
+        is_free=False,
+        official_website="https://longportapp.com",
+        documentation_url="https://open.longportapp.com",
+        features=["实时行情", "盘口数据", "多市场支持", "OpenAPI"],
     ),
     
     # yfinance
@@ -342,4 +358,3 @@ def is_data_source_supported(code: str) -> bool:
         是否支持
     """
     return code in DATA_SOURCE_REGISTRY
-

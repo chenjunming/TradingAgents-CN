@@ -334,6 +334,25 @@ TradingAgentsCN 已经获得 **13,000+ stars**，但一直由我一个人开发�
 
 📋 **详细更新日志**: [CHANGELOG.md](./docs/releases/CHANGELOG.md)
 
+## 🤖 个人投研助手（飞书版）
+
+后端已支持个人版投研助手能力：
+- 统一持仓（A股本地SQLite + 港美LongPort）
+- 选股建议与调仓建议 API
+- 飞书命令：`/daily` `/pick` `/rebalance` `/position`
+- 分市场推送（开市后30分钟、收盘前30分钟、收盘后30分钟）
+
+飞书接入模式支持：
+- `FEISHU_BOT_MODE=stream`（默认，推荐本地开发）
+- `FEISHU_BOT_MODE=webhook`（保留兼容）
+
+推荐同时配置以下优化项（已内置默认值）：
+- 进度推送降频：`FEISHU_ANALYSIS_PROGRESS_POLL_SECONDS`、`FEISHU_ANALYSIS_PROGRESS_MIN_PUSH_INTERVAL_SECONDS`、`FEISHU_ANALYSIS_PROGRESS_MIN_INCREMENT`
+- 进度心跳/超时：`FEISHU_ANALYSIS_PROGRESS_HEARTBEAT_SECONDS`、`FEISHU_ANALYSIS_PROGRESS_MAX_TRACK_MINUTES`
+- 僵尸任务自动清理：`ANALYSIS_ZOMBIE_CLEANUP_ENABLED`、`ANALYSIS_ZOMBIE_CLEANUP_INTERVAL_MINUTES`、`ANALYSIS_ZOMBIE_MAX_RUNNING_HOURS`
+
+详见文档：`docs/development/roadmap/feishu_advisor_personal_mvp.md`
+
 ## 📞 联系方式
 
 - **GitHub Issues**: [提交问题和建议](https://github.com/hsliuping/TradingAgents-CN/issues)

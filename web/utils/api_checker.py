@@ -14,6 +14,7 @@ def check_api_keys():
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY")
     qianfan_key = os.getenv("QIANFAN_API_KEY")
+    volcengine_key = os.getenv("VOLCENGINE_API_KEY")
 
     
     # 构建详细状态
@@ -53,6 +54,12 @@ def check_api_keys():
             "display": f"{qianfan_key[:16]}..." if qianfan_key else "未配置",
             "required": False,
             "description": "文心一言（千帆）API Key（OpenAI兼容），一般以 bce-v3/ 开头"
+        },
+        "VOLCENGINE_API_KEY": {
+            "configured": bool(volcengine_key),
+            "display": f"{volcengine_key[:16]}..." if volcengine_key else "未配置",
+            "required": False,
+            "description": "火山引擎方舟（ARK）API Key（OpenAI兼容）"
         },
         # QIANFAN_SECRET_KEY 不再用于OpenAI兼容路径，仅保留给脚本示例使用
         # "QIANFAN_SECRET_KEY": {

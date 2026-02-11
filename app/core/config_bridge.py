@@ -183,6 +183,7 @@ def bridge_config_to_env():
                 # 🔥 优先级：数据库配置 > .env 文件（用户在 Web 后台修改后立即生效）
                 if ds_config.type.value == 'tushare':
                     existing_token = os.getenv('TUSHARE_TOKEN')
+                    existing_http_url = os.getenv('TUSHARE_HTTP_URL')
 
                     # 优先使用数据库配置
                     if ds_config.api_key and not ds_config.api_key.startswith("your_"):
@@ -197,6 +198,16 @@ def bridge_config_to_env():
                     else:
                         logger.warning(f"  ⚠️  TUSHARE_TOKEN 在数据库和 .env 中都未配置有效值")
                         continue
+
+                    # 可选：桥接自定义 HTTP URL（数据库 endpoint 优先）
+                    endpoint = str(getattr(ds_config, "endpoint", "") or "").strip().rstrip("/")
+                    if endpoint and endpoint.startswith(("http://", "https://")):
+                        os.environ["TUSHARE_HTTP_URL"] = endpoint
+                        logger.info(f"  ✓ 使用数据库中的 TUSHARE_HTTP_URL: {endpoint}")
+                        if existing_http_url and existing_http_url != endpoint:
+                            logger.info("  ℹ️  已覆盖 .env 文件中的 TUSHARE_HTTP_URL")
+                    elif existing_http_url:
+                        logger.info(f"  ✓ 使用 .env 文件中的 TUSHARE_HTTP_URL: {existing_http_url}")
                     bridged_count += 1
 
                 # FinnHub API Key
@@ -217,6 +228,49 @@ def bridge_config_to_env():
                     else:
                         logger.warning(f"  ⚠️  FINNHUB_API_KEY 在数据库和 .env 中都未配置有效值")
                         continue
+                    bridged_count += 1
+
+                # Longport (Longbridge OpenAPI) credentials
+                # 约定：
+                # - api_key -> LONGPORT_APP_KEY
+                # - api_secret -> LONGPORT_APP_SECRET
+                # - config_params.access_token -> LONGPORT_ACCESS_TOKEN
+                elif ds_config.type.value == 'longport':
+                    existing_app_key = os.getenv('LONGPORT_APP_KEY')
+                    existing_app_secret = os.getenv('LONGPORT_APP_SECRET')
+                    existing_access_token = os.getenv('LONGPORT_ACCESS_TOKEN')
+
+                    access_token = None
+                    if getattr(ds_config, "config_params", None):
+                        access_token = ds_config.config_params.get("access_token")
+
+                    app_key = ds_config.api_key
+                    app_secret = ds_config.api_secret
+
+                    if app_key and not app_key.startswith("your_"):
+                        os.environ['LONGPORT_APP_KEY'] = app_key
+                        logger.info(f"  ✓ 使用数据库中的 LONGPORT_APP_KEY (长度: {len(app_key)})")
+                    elif existing_app_key and not existing_app_key.startswith("your_"):
+                        logger.info(f"  ✓ 使用 .env 文件中的 LONGPORT_APP_KEY (长度: {len(existing_app_key)})")
+                    else:
+                        logger.warning("  ⚠️  LONGPORT_APP_KEY 在数据库和 .env 中都未配置有效值")
+
+                    if app_secret and not app_secret.startswith("your_"):
+                        os.environ['LONGPORT_APP_SECRET'] = app_secret
+                        logger.info(f"  ✓ 使用数据库中的 LONGPORT_APP_SECRET (长度: {len(app_secret)})")
+                    elif existing_app_secret and not existing_app_secret.startswith("your_"):
+                        logger.info(f"  ✓ 使用 .env 文件中的 LONGPORT_APP_SECRET (长度: {len(existing_app_secret)})")
+                    else:
+                        logger.warning("  ⚠️  LONGPORT_APP_SECRET 在数据库和 .env 中都未配置有效值")
+
+                    if access_token and not access_token.startswith("your_"):
+                        os.environ['LONGPORT_ACCESS_TOKEN'] = access_token
+                        logger.info(f"  ✓ 使用数据库中的 LONGPORT_ACCESS_TOKEN (长度: {len(access_token)})")
+                    elif existing_access_token and not existing_access_token.startswith("your_"):
+                        logger.info(f"  ✓ 使用 .env 文件中的 LONGPORT_ACCESS_TOKEN (长度: {len(existing_access_token)})")
+                    else:
+                        logger.warning("  ⚠️  LONGPORT_ACCESS_TOKEN 在数据库和 .env 中都未配置有效值")
+
                     bridged_count += 1
 
         # 4. 桥接数据源细节配置（超时、重试、缓存等）
@@ -537,6 +591,9 @@ def clear_bridged_config():
         # 数据源 API 密钥
         'TUSHARE_TOKEN',
         'FINNHUB_API_KEY',
+        'LONGPORT_APP_KEY',
+        'LONGPORT_APP_SECRET',
+        'LONGPORT_ACCESS_TOKEN',
         # 系统配置
         'APP_TIMEZONE',
         'CURRENCY_PREFERENCE',
@@ -548,7 +605,7 @@ def clear_bridged_config():
         keys_to_clear.append(f'{provider}_API_KEY')
 
     # 清除数据源细节配置
-    data_sources = ['TUSHARE', 'AKSHARE', 'FINNHUB']
+    data_sources = ['TUSHARE', 'AKSHARE', 'FINNHUB', 'LONGPORT']
     for ds in data_sources:
         keys_to_clear.extend([
             f'{ds}_TIMEOUT',
@@ -734,4 +791,3 @@ __all__ = [
     'reload_bridged_config',
     'sync_pricing_config_now',
 ]
-

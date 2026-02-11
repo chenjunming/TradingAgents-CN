@@ -53,7 +53,8 @@ async def get_data_sources_status():
             descriptions = {
                 "tushare": "专业金融数据API，提供高质量的A股数据和财务指标",
                 "akshare": "开源金融数据库，提供基础的股票信息",
-                "baostock": "免费开源的证券数据平台，提供历史数据"
+                "baostock": "免费开源的证券数据平台，提供历史数据",
+                "longport": "长桥 OpenAPI，提供多市场实时行情（A股/港股/美股）",
             }
 
             status_item = {
@@ -106,7 +107,8 @@ async def get_current_data_source():
         descriptions = {
             "tushare": "专业金融数据API",
             "akshare": "开源金融数据库",
-            "baostock": "免费证券数据平台"
+            "baostock": "免费证券数据平台",
+            "longport": "长桥 OpenAPI 多市场行情",
         }
 
         result = {

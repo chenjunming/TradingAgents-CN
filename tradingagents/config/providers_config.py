@@ -24,6 +24,7 @@ class DataSourceConfig:
         self._configs["tushare"] = {
             "enabled": self._get_bool_env("TUSHARE_ENABLED", True),
             "token": os.getenv("TUSHARE_TOKEN", ""),
+            "http_url": os.getenv("TUSHARE_HTTP_URL", "").strip(),
             "timeout": self._get_int_env("TUSHARE_TIMEOUT", 30),
             "rate_limit": self._get_float_env("TUSHARE_RATE_LIMIT", 0.1),
             "max_retries": self._get_int_env("TUSHARE_MAX_RETRIES", 3),
@@ -142,4 +143,3 @@ def get_provider_config(provider_name: str) -> Dict[str, Any]:
     """获取指定提供器配置的便捷函数"""
     config = get_data_source_config()
     return config.get_provider_config(provider_name)
-

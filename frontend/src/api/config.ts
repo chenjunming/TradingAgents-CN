@@ -489,6 +489,7 @@ export const DATA_SOURCE_TYPES = {
   TUSHARE: 'tushare',
   AKSHARE: 'akshare',
   BAOSTOCK: 'baostock',
+  LONGPORT: 'longport',
 
   // 美股数据源
   FINNHUB: 'finnhub',

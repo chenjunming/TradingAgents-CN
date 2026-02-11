@@ -864,14 +864,27 @@ class ForeignStockService:
     
     def _format_hk_quote(self, data: Dict, code: str, source: str) -> Dict:
         """格式化港股行情数据"""
+        price = data.get('price') or data.get('close')
+        pre_close = data.get('pre_close') or data.get('prev_close')
+        pct = data.get('pct_chg')
+        if pct is None:
+            pct = data.get('change_percent')
+        if pct is None and price is not None and pre_close not in (None, 0, 0.0):
+            try:
+                pct = (float(price) / float(pre_close) - 1.0) * 100.0
+            except Exception:
+                pct = None
         return {
             'code': code,
             'name': data.get('name', f'港股{code}'),
             'market': 'HK',
-            'price': data.get('price') or data.get('close'),
+            'price': price,
             'open': data.get('open'),
             'high': data.get('high'),
             'low': data.get('low'),
+            'pre_close': pre_close,
+            'pct_chg': pct,
+            'change_percent': pct,
             'volume': data.get('volume'),
             'currency': data.get('currency', 'HKD'),
             'source': source,
@@ -1834,4 +1847,3 @@ class ForeignStockService:
         except Exception as e:
             logger.warning(f"⚠️ AKShare获取港股新闻失败: {e}")
             raise
-

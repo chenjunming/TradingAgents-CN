@@ -16,6 +16,15 @@ from .stock_models import (
     CurrencyType,
     StockStatus
 )
+from .advisor_models import (
+    UnifiedPosition,
+    CandidateStock,
+    RebalanceAction,
+    DailyBriefResponse,
+    MarketPushEvent,
+    FeishuCommandRequest,
+    FeishuCommandResponse,
+)
 
 __all__ = [
     "StockBasicInfoExtended",
@@ -28,5 +37,12 @@ __all__ = [
     "MarketType",
     "ExchangeType",
     "CurrencyType",
-    "StockStatus"
+    "StockStatus",
+    "UnifiedPosition",
+    "CandidateStock",
+    "RebalanceAction",
+    "DailyBriefResponse",
+    "MarketPushEvent",
+    "FeishuCommandRequest",
+    "FeishuCommandResponse",
 ]

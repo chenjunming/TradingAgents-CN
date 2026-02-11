@@ -427,6 +427,39 @@ class ChatCustomOpenAI(OpenAICompatibleBase):
         )
 
 
+class ChatVolcengineOpenAI(OpenAICompatibleBase):
+    """火山引擎方舟（ARK）OpenAI兼容适配器"""
+
+    def __init__(
+        self,
+        model: str = "ep-your-endpoint-id",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: Optional[int] = None,
+        **kwargs
+    ):
+        if base_url is None:
+            env_base_url = os.getenv("VOLCENGINE_BASE_URL")
+            # 只使用有效的环境变量值（不是占位符）
+            if env_base_url and not env_base_url.startswith('your_') and not env_base_url.startswith('your-'):
+                base_url = env_base_url
+            else:
+                # 火山引擎方舟 OpenAI 兼容默认端点
+                base_url = "https://ark.cn-beijing.volces.com/api/v3"
+
+        super().__init__(
+            provider_name="volcengine",
+            model=model,
+            api_key_env_var="VOLCENGINE_API_KEY",
+            base_url=base_url,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+
+
 # 支持的OpenAI兼容模型配置
 OPENAI_COMPATIBLE_PROVIDERS = {
     "deepseek": {
@@ -492,6 +525,17 @@ OPENAI_COMPATIBLE_PROVIDERS = {
             "llama-3.1-70b": {"context_length": 128000, "supports_function_calling": True},
             "llama-3.1-405b": {"context_length": 128000, "supports_function_calling": True},
             "custom-model": {"context_length": 32768, "supports_function_calling": True}
+        }
+    },
+    "volcengine": {
+        "adapter_class": ChatVolcengineOpenAI,
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "api_key_env": "VOLCENGINE_API_KEY",
+        "models": {
+            "ep-your-endpoint-id": {"context_length": 32768, "supports_function_calling": True},
+            "doubao-1.5-pro-32k": {"context_length": 32768, "supports_function_calling": True},
+            "doubao-1.5-lite-32k": {"context_length": 32768, "supports_function_calling": True},
+            "doubao-1.5-thinking-pro": {"context_length": 32768, "supports_function_calling": True}
         }
     }
 }

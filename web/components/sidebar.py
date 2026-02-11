@@ -217,8 +217,8 @@ def render_sidebar():
         # LLM提供商选择
         llm_provider = st.selectbox(
             "LLM提供商",
-            options=["dashscope", "deepseek", "google", "openai", "openrouter", "siliconflow", "custom_openai", "qianfan"],
-            index=["dashscope", "deepseek", "google", "openai", "openrouter", "siliconflow", "custom_openai", "qianfan"].index(st.session_state.llm_provider) if st.session_state.llm_provider in ["dashscope", "deepseek", "google", "openai", "openrouter", "siliconflow", "custom_openai", "qianfan"] else 0,
+            options=["dashscope", "deepseek", "google", "openai", "openrouter", "siliconflow", "custom_openai", "qianfan", "volcengine"],
+            index=["dashscope", "deepseek", "google", "openai", "openrouter", "siliconflow", "custom_openai", "qianfan", "volcengine"].index(st.session_state.llm_provider) if st.session_state.llm_provider in ["dashscope", "deepseek", "google", "openai", "openrouter", "siliconflow", "custom_openai", "qianfan", "volcengine"] else 0,
             format_func=lambda x: {
                 "dashscope": "🇨🇳 阿里百炼",
                 "deepseek": "🚀 DeepSeek V3",
@@ -227,7 +227,8 @@ def render_sidebar():
                 "openrouter": "🌐 OpenRouter",
                 "siliconflow": "🇨🇳 硅基流动",
                 "custom_openai": "🔧 自定义OpenAI端点",
-                "qianfan": "🧠 文心一言（千帆）"
+                "qianfan": "🧠 文心一言（千帆）",
+                "volcengine": "🌋 火山引擎（ARK）"
             }[x],
             help="选择AI模型提供商",
             key="llm_provider_select"
@@ -416,6 +417,52 @@ def render_sidebar():
             logger.debug(f"💾 [Persistence] Qianfan模型已保存: {llm_model}")
 
             save_model_selection(st.session_state.llm_provider, st.session_state.model_category, llm_model)
+        elif llm_provider == "volcengine":
+            volcengine_options = [
+                "ep-your-endpoint-id",
+                "doubao-1.5-pro-32k",
+                "doubao-1.5-lite-32k",
+                "doubao-1.5-thinking-pro",
+                "custom-model"
+            ]
+
+            current_index = 0
+            if st.session_state.llm_model in volcengine_options:
+                current_index = volcengine_options.index(st.session_state.llm_model)
+
+            llm_model = st.selectbox(
+                "选择火山引擎模型",
+                options=volcengine_options,
+                index=current_index,
+                format_func=lambda x: {
+                    "ep-your-endpoint-id": "Endpoint ID（推荐）- 例如 ep-xxxxxxxx",
+                    "doubao-1.5-pro-32k": "Doubao 1.5 Pro 32K",
+                    "doubao-1.5-lite-32k": "Doubao 1.5 Lite 32K",
+                    "doubao-1.5-thinking-pro": "Doubao 1.5 Thinking Pro",
+                    "custom-model": "自定义模型名称"
+                }[x],
+                help="火山引擎 ARK 兼容 OpenAI 协议，推荐直接填写 Endpoint ID（ep- 开头）",
+                key="volcengine_model_select"
+            )
+
+            if llm_model == "custom-model":
+                custom_volc_model_name = st.text_input(
+                    "自定义火山模型名称 / Endpoint ID",
+                    value="",
+                    placeholder="例如: ep-2026xxxxxxxx",
+                    help="推荐填写火山方舟创建的 Endpoint ID（ep- 开头）",
+                    key="volcengine_custom_model_name_input"
+                )
+                if custom_volc_model_name:
+                    llm_model = custom_volc_model_name
+
+            if st.session_state.llm_model != llm_model:
+                logger.debug(f"🔄 [Persistence] 火山引擎模型变更: {st.session_state.llm_model} → {llm_model}")
+            st.session_state.llm_model = llm_model
+            logger.debug(f"💾 [Persistence] 火山引擎模型已保存: {llm_model}")
+            save_model_selection(st.session_state.llm_provider, st.session_state.model_category, llm_model)
+
+            st.info("💡 **火山引擎配置**: 在 `.env` 中设置 `VOLCENGINE_API_KEY`，可选设置 `VOLCENGINE_BASE_URL`")
         elif llm_provider == "openai":
              openai_options = [
                  "gpt-4o",

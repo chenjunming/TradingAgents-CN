@@ -151,12 +151,50 @@ class Settings(BaseSettings):
 
     # 基础信息同步任务配置（可配置调度）
     SYNC_STOCK_BASICS_ENABLED: bool = Field(default=True)
+    # 是否在应用启动时立即执行一次基础信息同步（默认关闭，避免每次启动批量更新）
+    SYNC_STOCK_BASICS_RUN_ON_STARTUP: bool = Field(default=False)
+    # 判定“基础信息已足够”的最小记录数；达到该数量时，启动即同步会跳过
+    SYNC_STOCK_BASICS_INIT_MIN_COUNT: int = Field(default=4000, ge=1)
     # 优先使用 CRON 表达式，例如 "30 6 * * *" 表示每日 06:30
     SYNC_STOCK_BASICS_CRON: str = Field(default="")
     # 若未提供 CRON，则使用简单时间字符串 "HH:MM"（24小时制）
     SYNC_STOCK_BASICS_TIME: str = Field(default="06:30")
     # 时区
     TIMEZONE: str = Field(default="Asia/Shanghai")
+
+    # ==================== 个人投研助手配置 ====================
+    # A股本地SQLite
+    A_SHARE_SQLITE_PATH: str = Field(default="./data/local_investment.db")
+
+    # LongPort凭证（港美持仓）
+    LONGPORT_APP_KEY: str = Field(default="")
+    LONGPORT_APP_SECRET: str = Field(default="")
+    LONGPORT_ACCESS_TOKEN: str = Field(default="")
+
+    # 飞书机器人配置
+    FEISHU_BOT_MODE: str = Field(default="stream", description="飞书接入模式: stream/webhook")
+    FEISHU_BOT_APP_ID: str = Field(default="")
+    FEISHU_BOT_APP_SECRET: str = Field(default="")
+    FEISHU_BOT_VERIFICATION_TOKEN: str = Field(default="")
+    FEISHU_BOT_ENCRYPT_KEY: str = Field(default="")
+    FEISHU_BOT_DEFAULT_CHAT_ID: str = Field(default="")
+    FEISHU_BOT_API_BASE: str = Field(default="https://open.feishu.cn")
+    FEISHU_ANALYSIS_PROGRESS_POLL_SECONDS: int = Field(default=6, ge=2, le=60)
+    FEISHU_ANALYSIS_PROGRESS_MIN_PUSH_INTERVAL_SECONDS: int = Field(default=15, ge=3, le=300)
+    FEISHU_ANALYSIS_PROGRESS_MIN_INCREMENT: int = Field(default=10, ge=1, le=50)
+    FEISHU_ANALYSIS_PROGRESS_HEARTBEAT_SECONDS: int = Field(default=60, ge=10, le=600)
+    FEISHU_ANALYSIS_PROGRESS_MAX_TRACK_MINUTES: int = Field(default=120, ge=10, le=1440)
+
+    # 分市场推送配置
+    MARKET_PUSH_ENABLED: bool = Field(default=True)
+    MARKET_PUSH_SCAN_INTERVAL_SECONDS: int = Field(default=60, ge=10, le=3600)
+    MARKET_PUSH_WINDOW_SECONDS: int = Field(default=90, ge=10, le=600)
+    MARKET_PUSH_MARKETS: str = Field(default="CN,HK,US")
+    MARKET_PUSH_EXPOSURE_ONLY: bool = Field(default=True)
+    ANALYSIS_ZOMBIE_CLEANUP_ENABLED: bool = Field(default=True)
+    ANALYSIS_ZOMBIE_CLEANUP_RUN_ON_STARTUP: bool = Field(default=True)
+    ANALYSIS_ZOMBIE_CLEANUP_INTERVAL_MINUTES: int = Field(default=30, ge=5, le=1440)
+    ANALYSIS_ZOMBIE_MAX_RUNNING_HOURS: int = Field(default=2, ge=1, le=168)
 
     # 实时行情入库任务
     QUOTES_INGEST_ENABLED: bool = Field(default=True)
@@ -184,6 +222,7 @@ class Settings(BaseSettings):
 
     # Tushare基础配置
     TUSHARE_TOKEN: str = Field(default="", description="Tushare API Token")
+    TUSHARE_HTTP_URL: str = Field(default="", description="Tushare Pro HTTP URL（可选，自定义网关/加速地址）")
     TUSHARE_ENABLED: bool = Field(default=True, description="启用Tushare数据源")
     TUSHARE_TIER: str = Field(default="standard", description="Tushare积分等级 (free/basic/standard/premium/vip)")
     TUSHARE_RATE_LIMIT_SAFETY_MARGIN: float = Field(default=0.8, ge=0.1, le=1.0, description="速率限制安全边际")
@@ -260,15 +299,59 @@ class Settings(BaseSettings):
 
     # ==================== 港股数据配置 ====================
 
-    # 港股数据源配置（按需获取+缓存模式）
+    # 港股数据源配置（按需获取 + 定期增量同步）
     HK_DATA_CACHE_HOURS: int = Field(default=24, ge=1, le=168, description="港股数据缓存时长（小时）")
     HK_DEFAULT_DATA_SOURCE: str = Field(default="yfinance", description="港股默认数据源（yfinance/akshare）")
+    HK_UNIVERSE_MIN_COUNT: int = Field(default=1500, ge=100, le=10000, description="港股全量股票池最小规模阈值")
+
+    # 港股全量股票池同步
+    HK_UNIVERSE_SYNC_ENABLED: bool = Field(default=True, description="启用港股股票池全量同步")
+    HK_UNIVERSE_SYNC_CRON: str = Field(default="5 6 * * *", description="港股股票池全量同步CRON表达式")
+    HK_UNIVERSE_RUN_ON_STARTUP: bool = Field(default=True, description="应用启动时是否先执行一次港股股票池同步")
+
+    # 港股基础信息增量同步
+    HK_BASIC_INFO_SYNC_ENABLED: bool = Field(default=True, description="启用港股基础信息增量同步")
+    HK_BASIC_INFO_SYNC_CRON: str = Field(default="*/20 * * * *", description="港股基础信息增量同步CRON表达式")
+    HK_BASIC_INFO_INCREMENTAL_BATCH_SIZE: int = Field(default=300, ge=50, le=5000, description="港股基础信息增量批次大小")
+    HK_BASIC_INFO_SYNC_CONCURRENCY: int = Field(default=4, ge=1, le=64, description="港股基础信息同步并发数")
+
+    # 港股行情增量同步
+    HK_QUOTES_SYNC_ENABLED: bool = Field(default=True, description="启用港股行情增量同步")
+    HK_QUOTES_SYNC_CRON: str = Field(default="*/10 * * * *", description="港股行情增量同步CRON表达式")
+    HK_QUOTES_INCREMENTAL_BATCH_SIZE: int = Field(default=300, ge=50, le=5000, description="港股行情增量批次大小")
+    HK_QUOTES_SYNC_CONCURRENCY: int = Field(default=6, ge=1, le=64, description="港股行情同步并发数")
+
+    # 港股同步状态巡检
+    HK_STATUS_CHECK_ENABLED: bool = Field(default=True, description="启用港股同步状态检查")
+    HK_STATUS_CHECK_CRON: str = Field(default="10 * * * *", description="港股同步状态检查CRON表达式")
 
     # ==================== 美股数据配置 ====================
 
-    # 美股数据源配置（按需获取+缓存模式）
+    # 美股数据源配置（按需获取 + 定期增量同步）
     US_DATA_CACHE_HOURS: int = Field(default=24, ge=1, le=168, description="美股数据缓存时长（小时）")
     US_DEFAULT_DATA_SOURCE: str = Field(default="yfinance", description="美股默认数据源（yfinance/finnhub）")
+    US_UNIVERSE_MIN_COUNT: int = Field(default=3000, ge=100, le=50000, description="美股全量股票池最小规模阈值")
+
+    # 美股全量股票池同步（优先 Finnhub，回退 SEC/NasdaqTrader）
+    US_UNIVERSE_SYNC_ENABLED: bool = Field(default=True, description="启用美股股票池全量同步")
+    US_UNIVERSE_SYNC_CRON: str = Field(default="10 6 * * *", description="美股股票池全量同步CRON表达式")
+    US_UNIVERSE_RUN_ON_STARTUP: bool = Field(default=True, description="应用启动时是否先执行一次美股股票池同步")
+
+    # 美股基础信息增量同步（yfinance）
+    US_BASIC_INFO_SYNC_ENABLED: bool = Field(default=True, description="启用美股基础信息增量同步")
+    US_BASIC_INFO_SYNC_CRON: str = Field(default="*/15 * * * *", description="美股基础信息增量同步CRON表达式")
+    US_BASIC_INFO_INCREMENTAL_BATCH_SIZE: int = Field(default=300, ge=50, le=5000, description="美股基础信息增量批次大小")
+    US_BASIC_INFO_SYNC_CONCURRENCY: int = Field(default=6, ge=1, le=64, description="美股基础信息同步并发数")
+
+    # 美股行情增量同步（yfinance）
+    US_QUOTES_SYNC_ENABLED: bool = Field(default=True, description="启用美股行情增量同步")
+    US_QUOTES_SYNC_CRON: str = Field(default="*/15 * * * *", description="美股行情增量同步CRON表达式")
+    US_QUOTES_INCREMENTAL_BATCH_SIZE: int = Field(default=300, ge=50, le=5000, description="美股行情增量批次大小")
+    US_QUOTES_SYNC_CONCURRENCY: int = Field(default=8, ge=1, le=64, description="美股行情同步并发数")
+
+    # 美股同步状态巡检
+    US_STATUS_CHECK_ENABLED: bool = Field(default=True, description="启用美股同步状态检查")
+    US_STATUS_CHECK_CRON: str = Field(default="15 * * * *", description="美股同步状态检查CRON表达式")
 
     # ===== 新闻数据同步服务配置 =====
     NEWS_SYNC_ENABLED: bool = Field(default=True)

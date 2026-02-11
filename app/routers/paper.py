@@ -4,6 +4,8 @@ from typing import Literal, Optional, Dict, Any, List, Tuple
 from datetime import datetime
 import logging
 import re
+import os
+import asyncio
 
 from app.routers.auth_db import get_current_user
 from app.core.database import get_mongo_db
@@ -28,6 +30,21 @@ class PlaceOrderRequest(BaseModel):
     market: Optional[str] = Field(None, description="市场类型 (CN/HK/US)，不传则自动识别")
     # 可选：关联的分析ID，便于从分析页面一键下单后追踪
     analysis_id: Optional[str] = None
+
+
+class LongportSyncRequest(BaseModel):
+    symbols: Optional[List[str]] = Field(
+        default=None,
+        description="可选：指定要同步的标的（Longport 格式，如 700.HK/AAPL.US/600000.SH）",
+    )
+    replace_existing_longport_positions: bool = Field(
+        default=True,
+        description="是否替换当前用户已同步的长桥持仓（仅删除 source=longport 的旧持仓）",
+    )
+    sync_cash: bool = Field(
+        default=True,
+        description="是否同步账户可用现金到 paper_accounts.cash",
+    )
 
 
 def _detect_market_and_code(code: str) -> Tuple[str, str]:
@@ -265,6 +282,93 @@ def _zfill_code(code: str) -> str:
     if len(s) == 6 and s.isdigit():
         return s
     return s.zfill(6)
+
+
+def _longport_market_to_internal(market_obj: Any, symbol: str) -> str:
+    """
+    将 Longport 市场枚举映射到系统市场编码：CN/HK/US
+    """
+    # 优先依据 symbol 后缀判断，避免 SDK 枚举对象差异
+    sym = str(symbol or "").upper()
+    if sym.endswith(".HK"):
+        return "HK"
+    if sym.endswith(".US"):
+        return "US"
+    if sym.endswith(".SH") or sym.endswith(".SZ") or sym.endswith(".BJ"):
+        return "CN"
+
+    # 回退依据 market 对象类型名
+    name = ""
+    try:
+        if hasattr(market_obj, "__name__"):
+            name = str(getattr(market_obj, "__name__"))
+        else:
+            name = str(type(market_obj).__name__)
+    except Exception:
+        name = str(market_obj)
+    upper_name = name.upper()
+    if "HK" in upper_name:
+        return "HK"
+    if "US" in upper_name:
+        return "US"
+    if "CN" in upper_name:
+        return "CN"
+    return "CN"
+
+
+def _normalize_longport_symbol(symbol: str, market: str) -> str:
+    """
+    将 Longport symbol 归一化为本系统持仓 code：
+    - CN: 6位数字
+    - HK: 5位数字
+    - US: 大写字母代码
+    """
+    sym = str(symbol or "").upper().strip()
+    if "." in sym:
+        base = sym.split(".", 1)[0]
+    else:
+        base = sym
+
+    if market == "HK":
+        digits = "".join(ch for ch in base if ch.isdigit())
+        return digits.zfill(5) if digits else base
+    if market == "CN":
+        digits = "".join(ch for ch in base if ch.isdigit())
+        return digits.zfill(6) if digits else base
+    return base.upper()
+
+
+async def _get_longport_credentials() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    获取 Longport 凭证：
+    1) 环境变量
+    2) 数据库 system_configs 中 longport 数据源配置
+    """
+    app_key = os.getenv("LONGPORT_APP_KEY")
+    app_secret = os.getenv("LONGPORT_APP_SECRET")
+    access_token = os.getenv("LONGPORT_ACCESS_TOKEN")
+
+    if app_key and app_secret and access_token:
+        return app_key, app_secret, access_token
+
+    try:
+        db = get_mongo_db()
+        config_data = await db.system_configs.find_one({"is_active": True}, sort=[("version", -1)])
+        if config_data:
+            for ds in config_data.get("data_source_configs", []):
+                ds_type = str(ds.get("type", "")).lower()
+                ds_name = str(ds.get("name", "")).lower()
+                if ds_type != "longport" and ds_name != "longport":
+                    continue
+                cfg = ds.get("config_params", {}) or {}
+                app_key = app_key or ds.get("api_key")
+                app_secret = app_secret or ds.get("api_secret")
+                access_token = access_token or cfg.get("access_token")
+                break
+    except Exception as e:
+        logger.warning(f"⚠️ 读取 Longport 配置失败: {e}")
+
+    return app_key, app_secret, access_token
 
 
 @router.get("/account", response_model=dict)
@@ -583,3 +687,165 @@ async def reset_account(confirm: bool = Query(False), current_user: dict = Depen
     # 重新创建账户
     acc = await _get_or_create_account(current_user["id"])
     return ok({"message": "账户已重置", "cash": acc.get("cash", {})})
+
+
+@router.post("/sync/longport/positions", response_model=dict)
+async def sync_longport_positions(
+    payload: LongportSyncRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    从 Longport 同步持仓到 paper_positions，用于后续 agent 调仓分析。
+    """
+    user_id = current_user["id"]
+    db = get_mongo_db()
+
+    try:
+        from longport.openapi import Config, TradeContext
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="Longport SDK 未安装，请先安装依赖：pip install longport",
+        )
+
+    app_key, app_secret, access_token = await _get_longport_credentials()
+    if not (app_key and app_secret and access_token):
+        raise HTTPException(
+            status_code=400,
+            detail="Longport 凭证不完整，请配置 LONGPORT_APP_KEY/LONGPORT_APP_SECRET/LONGPORT_ACCESS_TOKEN",
+        )
+
+    # 给 SDK 提供环境变量（Config.from_env 读取）
+    os.environ["LONGPORT_APP_KEY"] = app_key
+    os.environ["LONGPORT_APP_SECRET"] = app_secret
+    os.environ["LONGPORT_ACCESS_TOKEN"] = access_token
+
+    now_iso = datetime.utcnow().isoformat()
+
+    # 确保账户存在
+    await _get_or_create_account(user_id)
+
+    # 拉取长桥持仓与余额
+    try:
+        with TradeContext(Config.from_env()) as ctx:
+            stock_resp = await asyncio.to_thread(ctx.stock_positions, payload.symbols)
+            balances = await asyncio.to_thread(ctx.account_balance)
+    except Exception as e:
+        logger.error(f"❌ Longport 持仓同步失败: {e}")
+        raise HTTPException(status_code=502, detail=f"Longport 接口调用失败: {str(e)}")
+
+    channels = getattr(stock_resp, "channels", []) or []
+    upsert_count = 0
+    skip_count = 0
+    synced_keys = set()
+    synced_positions: List[Dict[str, Any]] = []
+
+    for ch in channels:
+        channel_name = str(getattr(ch, "account_channel", "") or "")
+        positions = getattr(ch, "positions", []) or []
+        for p in positions:
+            symbol = str(getattr(p, "symbol", "") or "")
+            if not symbol:
+                skip_count += 1
+                continue
+
+            market = _longport_market_to_internal(getattr(p, "market", None), symbol)
+            code = _normalize_longport_symbol(symbol, market)
+            if not code:
+                skip_count += 1
+                continue
+
+            # 现有系统使用 int 持仓数量，若出现碎股则保留 raw_quantity
+            raw_qty = float(getattr(p, "quantity", 0) or 0)
+            raw_available = float(getattr(p, "available_quantity", 0) or 0)
+            qty = int(raw_qty)
+            available_qty = int(raw_available)
+
+            if qty <= 0:
+                skip_count += 1
+                continue
+
+            doc = {
+                "user_id": user_id,
+                "code": code,
+                "market": market,
+                "currency": str(getattr(p, "currency", "") or ("CNY" if market == "CN" else "HKD" if market == "HK" else "USD")),
+                "quantity": qty,
+                "available_qty": max(0, min(available_qty, qty)),
+                "frozen_qty": max(0, qty - available_qty),
+                "avg_cost": float(getattr(p, "cost_price", 0) or 0),
+                "symbol_name": str(getattr(p, "symbol_name", "") or ""),
+                "source": "longport",
+                "source_channel": channel_name,
+                "external_symbol": symbol,
+                "raw_quantity": raw_qty,
+                "raw_available_quantity": raw_available,
+                "updated_at": now_iso,
+            }
+
+            await db["paper_positions"].update_one(
+                {"user_id": user_id, "code": code, "market": market},
+                {"$set": doc},
+                upsert=True,
+            )
+            synced_keys.add(f"{market}:{code}")
+            synced_positions.append({"code": code, "market": market, "quantity": qty, "external_symbol": symbol})
+            upsert_count += 1
+
+    # 替换旧 longport 持仓（不影响手工/其他来源持仓）
+    removed_count = 0
+    if payload.replace_existing_longport_positions:
+        existing = await db["paper_positions"].find({"user_id": user_id, "source": "longport"}).to_list(None)
+        for pos in existing:
+            key = f"{pos.get('market', 'CN')}:{pos.get('code', '')}"
+            if key not in synced_keys:
+                await db["paper_positions"].delete_one({"_id": pos["_id"]})
+                removed_count += 1
+
+    # 同步现金（可选）
+    cash_updates: Dict[str, float] = {}
+    if payload.sync_cash:
+        for b in (balances or []):
+            # 优先用 cash_infos.available_cash
+            cur = str(getattr(b, "currency", "") or "").upper()
+            if not cur:
+                continue
+            available_cash = None
+            cash_infos = getattr(b, "cash_infos", []) or []
+            for ci in cash_infos:
+                ci_cur = str(getattr(ci, "currency", "") or "").upper()
+                if ci_cur == cur:
+                    available_cash = float(getattr(ci, "available_cash", 0) or 0)
+                    break
+            if available_cash is None:
+                available_cash = float(getattr(b, "total_cash", 0) or 0)
+            cash_updates[cur] = round(available_cash, 2)
+
+        if cash_updates:
+            set_doc = {f"cash.{k}": v for k, v in cash_updates.items()}
+            set_doc["updated_at"] = now_iso
+            await db["paper_accounts"].update_one({"user_id": user_id}, {"$set": set_doc}, upsert=True)
+
+    # 记录同步日志（供后续 agent / 审计查询）
+    await db["paper_portfolio_sync_logs"].insert_one({
+        "user_id": user_id,
+        "source": "longport",
+        "synced_positions_count": upsert_count,
+        "removed_positions_count": removed_count,
+        "skipped_positions_count": skip_count,
+        "synced_cash": cash_updates,
+        "replace_existing_longport_positions": payload.replace_existing_longport_positions,
+        "sync_cash": payload.sync_cash,
+        "symbols_filter": payload.symbols or [],
+        "created_at": now_iso,
+    })
+
+    return ok({
+        "source": "longport",
+        "synced_positions_count": upsert_count,
+        "removed_positions_count": removed_count,
+        "skipped_positions_count": skip_count,
+        "synced_cash": cash_updates,
+        "positions_preview": synced_positions[:20],
+        "updated_at": now_iso,
+    })

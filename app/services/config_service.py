@@ -452,6 +452,19 @@ class ConfigService:
                     enabled=False,
                     priority=2,
                     description="Tushare专业金融数据接口"
+                ),
+                DataSourceConfig(
+                    name="Longport",
+                    type=DataSourceType.LONGPORT,
+                    api_key="your-longport-app-key",
+                    api_secret="your-longport-app-secret",
+                    endpoint="https://open.longportapp.com",
+                    timeout=30,
+                    rate_limit=120,
+                    enabled=False,
+                    priority=3,
+                    config_params={"access_token": "your-longport-access-token"},
+                    description="Longport长桥OpenAPI（实时行情）"
                 )
             ],
             default_data_source="AKShare",
@@ -1241,7 +1254,11 @@ class ConfigService:
                     logger.info(f"🔌 [TEST] Calling Tushare API with token (length: {len(api_key)})")
                     import tushare as ts
                     ts.set_token(api_key)
-                    pro = ts.pro_api()
+                    pro = ts.pro_api(token=api_key)
+                    custom_http_url = (os.getenv("TUSHARE_HTTP_URL") or "").strip().rstrip("/")
+                    if custom_http_url:
+                        setattr(pro, "_DataApi__http_url", custom_http_url)
+                        logger.info(f"🔗 [TEST] 使用自定义 Tushare HTTP URL: {custom_http_url}")
                     # 获取交易日历（轻量级测试）
                     df = pro.trade_cal(exchange='SSE', start_date='20240101', end_date='20240101')
 
@@ -1393,6 +1410,68 @@ class ConfigService:
                     return {
                         "success": False,
                         "message": f"BaoStock API 调用失败: {str(e)}",
+                        "response_time": time.time() - start_time,
+                        "details": None
+                    }
+
+            elif ds_type == "longport":
+                # Longport 需要三元凭证：app_key / app_secret / access_token
+                app_key = ds_config.api_key or os.getenv("LONGPORT_APP_KEY")
+                app_secret = ds_config.api_secret or os.getenv("LONGPORT_APP_SECRET")
+                access_token = None
+                if ds_config.config_params:
+                    access_token = ds_config.config_params.get("access_token")
+                access_token = access_token or os.getenv("LONGPORT_ACCESS_TOKEN")
+
+                if not (app_key and app_secret and access_token):
+                    return {
+                        "success": False,
+                        "message": "Longport 凭证不完整，请配置 LONGPORT_APP_KEY / LONGPORT_APP_SECRET / LONGPORT_ACCESS_TOKEN",
+                        "response_time": time.time() - start_time,
+                        "details": None
+                    }
+
+                try:
+                    from longport.openapi import Config, QuoteContext
+
+                    os.environ["LONGPORT_APP_KEY"] = app_key
+                    os.environ["LONGPORT_APP_SECRET"] = app_secret
+                    os.environ["LONGPORT_ACCESS_TOKEN"] = access_token
+
+                    # 轻量级测试：请求一只常见港股
+                    ctx = QuoteContext(Config.from_env())
+                    data = ctx.quote(["700.HK"])
+
+                    response_time = time.time() - start_time
+                    if data is not None:
+                        return {
+                            "success": True,
+                            "message": "成功连接到 Longport 数据源",
+                            "response_time": response_time,
+                            "details": {
+                                "type": ds_type,
+                                "endpoint": ds_config.endpoint or "https://open.longportapp.com",
+                                "test_result": "quote 接口调用成功"
+                            }
+                        }
+
+                    return {
+                        "success": False,
+                        "message": "Longport API 返回空数据",
+                        "response_time": response_time,
+                        "details": None
+                    }
+                except ImportError:
+                    return {
+                        "success": False,
+                        "message": "Longport SDK 未安装，请运行: pip install longport",
+                        "response_time": time.time() - start_time,
+                        "details": None
+                    }
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "message": f"Longport API 调用失败: {str(e)}",
                         "response_time": time.time() - start_time,
                         "details": None
                     }
@@ -2852,6 +2931,7 @@ class ConfigService:
             "deepseek": "DEEPSEEK_API_KEY",
             "dashscope": "DASHSCOPE_API_KEY",
             "qianfan": "QIANFAN_API_KEY",
+            "volcengine": "VOLCENGINE_API_KEY",
             "azure": "AZURE_OPENAI_API_KEY",
             "siliconflow": "SILICONFLOW_API_KEY",
             "openrouter": "OPENROUTER_API_KEY",
@@ -3169,6 +3249,15 @@ class ConfigService:
                     "website": "https://www.deepseek.com",
                     "api_doc_url": "https://platform.deepseek.com/api-docs",
                     "default_base_url": "https://api.deepseek.com",
+                    "supported_features": ["chat", "completion", "function_calling", "streaming"]
+                },
+                {
+                    "name": "volcengine",
+                    "display_name": "火山引擎（ARK）",
+                    "description": "火山引擎方舟提供 OpenAI 兼容接口，支持豆包等模型",
+                    "website": "https://www.volcengine.com",
+                    "api_doc_url": "https://www.volcengine.com/docs/82379",
+                    "default_base_url": "https://ark.cn-beijing.volces.com/api/v3",
                     "supported_features": ["chat", "completion", "function_calling", "streaming"]
                 }
             ]

@@ -85,7 +85,8 @@ def render_analysis_info(results):
             provider_name = {
                 'dashscope': '阿里百炼',
                 'google': 'Google AI',
-                'qianfan': '文心一言（千帆）'
+                'qianfan': '文心一言（千帆）',
+                'volcengine': '火山引擎（ARK）'
             }.get(llm_provider, llm_provider)
 
             st.metric(

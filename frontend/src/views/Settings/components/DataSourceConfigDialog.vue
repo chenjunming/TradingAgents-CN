@@ -295,7 +295,7 @@ const isEdit = computed(() => !!props.config)
 const needsApiSecret = computed(() => {
   const type = formData.value.type?.toLowerCase() || ''
   // 某些数据源类型需要 API Secret
-  return ['alpha_vantage', 'wind', 'choice'].includes(type)
+  return ['alpha_vantage', 'wind', 'choice', 'longport'].includes(type)
 })
 
 // 当前选中的数据源信息
@@ -326,6 +326,14 @@ const handleTypeChange = () => {
       if (sourceInfo) {
         formData.value.display_name = sourceInfo.label
       }
+    }
+  }
+
+  // Longport 需要 access_token，默认在自定义参数中预置该键
+  if (selectedType === 'longport' && !('access_token' in (formData.value.config_params || {}))) {
+    formData.value.config_params = {
+      ...(formData.value.config_params || {}),
+      access_token: ''
     }
   }
 }
@@ -376,6 +384,12 @@ const dataSourceTypes = [
     value: 'baostock',
     register_url: 'http://baostock.com/',
     register_guide: 'BaoStock 是开源免费的证券数据平台，无需注册即可使用。访问官网了解更多：'
+  },
+  {
+    label: 'Longport (长桥)',
+    value: 'longport',
+    register_url: 'https://open.longportapp.com',
+    register_guide: 'Longport 需要 APP Key / APP Secret / Access Token 三项凭证。请先在开放平台创建应用并获取凭证：'
   },
 
   // 美股数据源

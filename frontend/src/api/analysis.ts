@@ -329,6 +329,7 @@ export const DATA_SOURCES = {
   TUSHARE: 'tushare',
   AKSHARE: 'akshare',
   BAOSTOCK: 'baostock',
+  LONGPORT: 'longport',
 
   // 美股数据源
   FINNHUB: 'finnhub',
@@ -421,6 +422,7 @@ export const formatDataSource = (source: string): string => {
     finnhub: 'FinnHub',
     tushare: 'Tushare',
     akshare: 'AKShare',
+    longport: 'Longport',
     yahoo: 'Yahoo Finance'
   }
   return sourceMap[source] ?? source
@@ -476,7 +478,6 @@ export const getStockPlaceholder = (market: string): string => {
   }
   return placeholders[market] ?? '输入股票代码'
 }
-
 
 
 

@@ -6,5 +6,5 @@ from .base import DataSourceAdapter
 from .tushare_adapter import TushareAdapter
 from .akshare_adapter import AKShareAdapter
 from .baostock_adapter import BaoStockAdapter
+from .longport_adapter import LongportAdapter
 from .manager import DataSourceManager
-
