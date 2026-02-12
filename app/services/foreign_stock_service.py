@@ -185,6 +185,7 @@ class ForeignStockService:
             # 数据源名称映射（数据库名称 → 处理函数）
             # 🔥 只有这些是有效的数据源名称
             source_handlers = {
+                'yfinance': ('yfinance', self._get_hk_quote_from_yfinance),
                 'yahoo_finance': ('yfinance', self._get_hk_quote_from_yfinance),
                 'akshare': ('akshare', self._get_hk_quote_from_akshare),
             }
@@ -356,6 +357,7 @@ class ForeignStockService:
             # 🔥 只有这些是有效的数据源名称：alpha_vantage, yahoo_finance, finnhub
             source_handlers = {
                 'alpha_vantage': ('alpha_vantage', self._get_us_quote_from_alpha_vantage),
+                'yfinance': ('yfinance', self._get_us_quote_from_yfinance),
                 'yahoo_finance': ('yfinance', self._get_us_quote_from_yfinance),
                 'finnhub': ('finnhub', self._get_us_quote_from_finnhub),
             }

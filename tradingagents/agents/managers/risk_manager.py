@@ -4,18 +4,24 @@ import json
 # 导入统一日志系统
 from tradingagents.utils.logging_init import get_logger
 logger = get_logger("default")
+from tradingagents.agents.utils.prompt_contract import (
+    get_anti_repetition_rules,
+    get_concise_contract,
+    get_output_schema,
+)
 
 
 def create_risk_manager(llm, memory):
     def risk_manager_node(state) -> dict:
 
         company_name = state["company_of_interest"]
+        expression_profile = state.get("expression_profile", "balanced")
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
         market_research_report = state["market_report"]
         news_report = state["news_report"]
-        fundamentals_report = state["news_report"]
+        fundamentals_report = state["fundamentals_report"]
         sentiment_report = state["sentiment_report"]
         trader_plan = state["investment_plan"]
 
@@ -32,26 +38,32 @@ def create_risk_manager(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
-        prompt = f"""作为风险管理委员会主席和辩论主持人，您的目标是评估三位风险分析师——激进、中性和安全/保守——之间的辩论，并确定交易员的最佳行动方案。您的决策必须产生明确的建议：买入、卖出或持有。只有在有具体论据强烈支持时才选择持有，而不是在所有方面都似乎有效时作为后备选择。力求清晰和果断。
+        concise_contract = get_concise_contract("risk_manager", expression_profile)
+        output_schema = get_output_schema("risk_manager")
+        anti_repetition_rules = get_anti_repetition_rules()
 
-决策指导原则：
-1. **总结关键论点**：提取每位分析师的最强观点，重点关注与背景的相关性。
-2. **提供理由**：用辩论中的直接引用和反驳论点支持您的建议。
-3. **完善交易员计划**：从交易员的原始计划**{trader_plan}**开始，根据分析师的见解进行调整。
-4. **从过去的错误中学习**：使用**{past_memory_str}**中的经验教训来解决先前的误判，改进您现在做出的决策，确保您不会做出错误的买入/卖出/持有决定而亏损。
+        prompt = f"""你是风险管理委员会主席，负责给出最终风险裁决并修订交易方案。
 
-交付成果：
-- 明确且可操作的建议：买入、卖出或持有。
-- 基于辩论和过去反思的详细推理。
+{concise_contract}
+角色输出模板：{output_schema}
+{anti_repetition_rules}
 
----
+硬性要求：
+1. 必须给出明确建议：买入/卖出/持有。
+2. 必须给出触发条件与监控指标，避免模糊表达。
+3. 必须指出交易员原始计划需要调整的具体点：{trader_plan}
+4. 必须结合历史反思避免重复错误：{past_memory_str}
 
-**分析师辩论历史：**
+背景输入：
+市场研究：{market_research_report}
+情绪分析：{sentiment_report}
+新闻分析：{news_report}
+基本面分析：{fundamentals_report}
+
+风险辩论历史：
 {history}
 
----
-
-专注于可操作的见解和持续改进。建立在过去经验教训的基础上，批判性地评估所有观点，确保每个决策都能带来更好的结果。请用中文撰写所有分析内容和建议。"""
+请用中文输出可执行结论。"""
 
         # 📊 统计 prompt 大小
         prompt_length = len(prompt)

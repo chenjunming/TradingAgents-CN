@@ -33,6 +33,7 @@ from app.services.config_service import ConfigService
 from app.services.memory_state_manager import get_memory_state_manager, TaskStatus
 from app.services.redis_progress_tracker import RedisProgressTracker, get_progress_by_id
 from app.services.progress_log_handler import register_analysis_tracker, unregister_analysis_tracker
+from tradingagents.llm_adapters.token_usage_context import token_usage_context
 
 # 股票基础信息获取（用于补充显示名称）
 try:
@@ -85,6 +86,89 @@ async def get_provider_by_model_name(model_name: str) -> str:
         return _get_default_provider_by_model(model_name)
 
 
+def _get_env_models() -> tuple[Optional[str], Optional[str]]:
+    """
+    从环境变量获取 quick/deep 模型（环境变量优先）
+    """
+    import os
+
+    quick_model = (
+        os.getenv("TRADINGAGENTS_QUICK_MODEL")
+        or os.getenv("QUICK_ANALYSIS_MODEL")
+        or ""
+    ).strip()
+    deep_model = (
+        os.getenv("TRADINGAGENTS_DEEP_MODEL")
+        or os.getenv("DEEP_ANALYSIS_MODEL")
+        or ""
+    ).strip()
+
+    # 飞书场景：未单独配置 quick/deep 时，复用 FEISHU_NL_AGENT_MODEL
+    fallback_model = (os.getenv("FEISHU_NL_AGENT_MODEL") or "").strip()
+    if not quick_model and fallback_model:
+        quick_model = fallback_model
+    if not deep_model and fallback_model:
+        deep_model = fallback_model
+
+    if quick_model and deep_model:
+        return quick_model, deep_model
+    return None, None
+
+
+def _infer_provider_from_model_env_first(model_name: str) -> str:
+    """
+    基于模型名的环境变量优先推断（避免数据库错误映射影响）
+    """
+    name = (model_name or "").strip().lower()
+    if not name:
+        return "dashscope"
+    if name.startswith("ep-") or "doubao" in name:
+        return "volcengine"
+    if name.startswith("qwen"):
+        return "dashscope"
+    if name.startswith("gpt"):
+        return "openai"
+    if name.startswith("deepseek"):
+        return "deepseek"
+    if name.startswith("glm") or "chatglm" in name:
+        return "zhipu"
+    if name.startswith("gemini"):
+        return "google"
+    return _get_default_provider_by_model(model_name)
+
+
+def _get_env_provider_info_by_model(model_name: str) -> dict:
+    """
+    直接从环境变量推导 provider/base_url/api_key。
+    当环境中存在有效模型配置时，优先使用该结果。
+    """
+    import os
+
+    provider = _infer_provider_from_model_env_first(model_name)
+
+    base_url_map = {
+        "volcengine": os.getenv("VOLCENGINE_BASE_URL") or "https://ark.cn-beijing.volces.com/api/v3",
+        "dashscope": os.getenv("DASHSCOPE_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "openai": os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1",
+        "deepseek": os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com",
+        "zhipu": os.getenv("ZHIPU_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4",
+        "google": os.getenv("GOOGLE_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta",
+        "qianfan": os.getenv("QIANFAN_BASE_URL") or "https://qianfan.baidubce.com/v2",
+    }
+
+    # 火山允许复用 OPENAI_API_KEY；其余按各自键名读取
+    if provider == "volcengine":
+        api_key = (os.getenv("VOLCENGINE_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+    else:
+        api_key = (_get_env_api_key_for_provider(provider) or "").strip()
+
+    return {
+        "provider": provider,
+        "backend_url": base_url_map.get(provider) or _get_default_backend_url(provider),
+        "api_key": api_key or None,
+    }
+
+
 def get_provider_by_model_name_sync(model_name: str) -> str:
     """
     根据模型名称从数据库配置中查找对应的供应商（同步版本）
@@ -110,6 +194,16 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
         dict: {"provider": "google", "backend_url": "https://...", "api_key": "xxx"}
     """
     try:
+        # 0) 环境变量优先：当模型命中环境配置时，直接返回，避免数据库映射干扰
+        env_quick, env_deep = _get_env_models()
+        if model_name and model_name in {env_quick, env_deep}:
+            env_info = _get_env_provider_info_by_model(model_name)
+            logger.info(
+                f"✅ [同步查询] 环境变量优先命中模型 {model_name}: "
+                f"provider={env_info['provider']}, backend_url={env_info['backend_url']}"
+            )
+            return env_info
+
         # 使用同步 MongoDB 客户端直接查询
         from pymongo import MongoClient
         from app.core.config import settings
@@ -275,6 +369,13 @@ def get_active_system_models_sync() -> tuple[Optional[str], Optional[str]]:
     """
     从 MongoDB 的活跃系统配置读取 quick/deep 模型。
     """
+    # 1) 环境变量优先（显式配置后不受数据库影响）
+    env_quick_model, env_deep_model = _get_env_models()
+    if env_quick_model and env_deep_model:
+        logger.info(f"✅ 使用环境变量模型: quick={env_quick_model}, deep={env_deep_model}")
+        return env_quick_model, env_deep_model
+
+    # 2) 回退到数据库配置
     try:
         from pymongo import MongoClient
         from app.core.config import settings
@@ -375,6 +476,11 @@ def _get_default_provider_by_model(model_name: str) -> str:
     根据模型名称返回默认的供应商映射
     这是一个后备方案，当数据库查询失败时使用
     """
+    # 环境变量优先推断（避免数据库或旧映射影响）
+    env_provider = _infer_provider_from_model_env_first(model_name)
+    if env_provider:
+        return env_provider
+
     # 模型名称到供应商的默认映射
     model_provider_map = {
         # 阿里百炼 (DashScope)
@@ -419,7 +525,8 @@ def create_analysis_config(
     llm_provider: str,
     market_type: str = "A股",
     quick_model_config: dict = None,  # 新增：快速模型的完整配置
-    deep_model_config: dict = None    # 新增：深度模型的完整配置
+    deep_model_config: dict = None,    # 新增：深度模型的完整配置
+    expression_profile: str = "balanced",
 ) -> dict:
     """
     创建分析配置 - 支持数字等级和中文等级
@@ -433,6 +540,7 @@ def create_analysis_config(
         market_type: 市场类型
         quick_model_config: 快速模型的完整配置（包含 max_tokens、temperature、timeout 等）
         deep_model_config: 深度模型的完整配置（包含 max_tokens、temperature、timeout 等）
+        expression_profile: 提示词表达强度（light | balanced | strong）
 
     Returns:
         dict: 完整的分析配置
@@ -485,6 +593,7 @@ def create_analysis_config(
     config["llm_provider"] = llm_provider
     config["deep_think_llm"] = deep_model
     config["quick_think_llm"] = quick_model
+    config["expression_profile"] = expression_profile if expression_profile in {"light", "balanced", "strong"} else "balanced"
 
     # 根据研究深度调整配置 - 支持5个级别（与Web界面保持一致）
     if research_depth == "快速":
@@ -1459,7 +1568,8 @@ class SimpleAnalysisService:
                 quick_model=quick_model,
                 deep_model=deep_model,
                 llm_provider=quick_provider,  # 主要使用快速模型的供应商
-                market_type=market_type  # 使用前端传递的市场类型
+                market_type=market_type,  # 使用前端传递的市场类型
+                expression_profile=getattr(request.parameters, "expression_profile", "balanced") if request.parameters else "balanced",
             )
 
             # 🔧 添加混合模式配置
@@ -1724,13 +1834,14 @@ class SimpleAnalysisService:
                 stock_code=request.stock_code or "",
                 market_type=market_type,
             )
-            state, decision = trading_graph.propagate(
-                request.stock_code,
-                analysis_date,
-                progress_callback=graph_progress_callback,
-                task_id=task_id,
-                position_context=position_context,
-            )
+            with token_usage_context(session_id=task_id, analysis_type="stock_analysis"):
+                state, decision = trading_graph.propagate(
+                    request.stock_code,
+                    analysis_date,
+                    progress_callback=graph_progress_callback,
+                    task_id=task_id,
+                    position_context=position_context,
+                )
 
             logger.info(f"✅ trading_graph.propagate 执行完成")
 
@@ -2028,6 +2139,13 @@ class SimpleAnalysisService:
             # 从决策中提取模型信息
             model_info = decision.get('model_info', 'Unknown') if isinstance(decision, dict) else 'Unknown'
 
+            # 汇总本次分析会话的 token 用量（来自 token_usage 集合）
+            token_summary = self._get_token_usage_summary_sync(task_id)
+            total_tokens_used = token_summary.get("total_tokens", 0)
+            if isinstance(decision, dict):
+                decision["tokens_used"] = total_tokens_used
+                decision["token_usage"] = token_summary
+
             # 构建结果
             result = {
                 "analysis_id": str(uuid.uuid4()),
@@ -2041,7 +2159,7 @@ class SimpleAnalysisService:
                 "key_points": [],  # 可以从reasoning中提取关键点
                 "detailed_analysis": decision,
                 "execution_time": execution_time,
-                "tokens_used": decision.get("tokens_used", 0) if isinstance(decision, dict) else 0,
+                "tokens_used": total_tokens_used,
                 "state": state,
                 # 添加分析师信息
                 "analysts": request.parameters.selected_analysts if request.parameters else [],
@@ -2093,6 +2211,50 @@ class SimpleAnalysisService:
 
             # 抛出包含友好错误信息的异常
             raise Exception(user_friendly_error) from e
+
+    def _get_token_usage_summary_sync(self, session_id: str) -> Dict[str, int]:
+        """按会话ID汇总token_usage记录（同步线程内调用）。"""
+        summary = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        if not session_id:
+            return summary
+
+        try:
+            from pymongo import MongoClient
+            from app.core.config import settings
+
+            client = MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=4000)
+            db = client[settings.MONGO_DB]
+
+            cursor = db.token_usage.find(
+                {"session_id": session_id},
+                {"_id": 0, "input_tokens": 1, "output_tokens": 1},
+            )
+            for doc in cursor:
+                input_tokens = int(doc.get("input_tokens", 0) or 0)
+                output_tokens = int(doc.get("output_tokens", 0) or 0)
+                summary["requests"] += 1
+                summary["prompt_tokens"] += input_tokens
+                summary["completion_tokens"] += output_tokens
+
+            summary["total_tokens"] = summary["prompt_tokens"] + summary["completion_tokens"]
+            logger.info(
+                "📊 [Token汇总] session=%s requests=%s prompt=%s completion=%s total=%s",
+                session_id,
+                summary["requests"],
+                summary["prompt_tokens"],
+                summary["completion_tokens"],
+                summary["total_tokens"],
+            )
+            client.close()
+        except Exception as e:
+            logger.warning(f"⚠️ [Token汇总] 查询失败，使用0值: session={session_id}, err={e}")
+
+        return summary
 
     async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         """获取任务状态"""

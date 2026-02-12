@@ -359,14 +359,17 @@ async def lifespan(app: FastAPI):
         # 实时行情入库任务（每N秒），内部自判交易时段
         if settings.QUOTES_INGEST_ENABLED:
             quotes_ingestion = QuotesIngestionService()
-            await quotes_ingestion.ensure_indexes()
-            scheduler.add_job(
-                quotes_ingestion.run_once,  # coroutine function; AsyncIOScheduler will await it
-                IntervalTrigger(seconds=settings.QUOTES_INGEST_INTERVAL_SECONDS, timezone=settings.TIMEZONE),
-                id="quotes_ingestion_service",
-                name="实时行情入库服务"
-            )
-            logger.info(f"⏱ 实时行情入库任务已启动: 每 {settings.QUOTES_INGEST_INTERVAL_SECONDS}s")
+            try:
+                await quotes_ingestion.ensure_indexes()
+                scheduler.add_job(
+                    quotes_ingestion.run_once,  # coroutine function; AsyncIOScheduler will await it
+                    IntervalTrigger(seconds=settings.QUOTES_INGEST_INTERVAL_SECONDS, timezone=settings.TIMEZONE),
+                    id="quotes_ingestion_service",
+                    name="实时行情入库服务"
+                )
+                logger.info(f"⏱ 实时行情入库任务已启动: 每 {settings.QUOTES_INGEST_INTERVAL_SECONDS}s")
+            except Exception as e:
+                logger.warning(f"⚠️ 实时行情入库任务跳过（MongoDB 不可用）: {e}")
 
         # Tushare统一数据同步任务配置
         logger.info("🔄 配置Tushare统一数据同步任务...")

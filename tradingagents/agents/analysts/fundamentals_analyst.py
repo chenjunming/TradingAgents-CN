@@ -3,6 +3,8 @@
 使用统一工具自动识别股票类型并调用相应数据源
 """
 
+import os
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -15,6 +17,11 @@ logger = get_logger("default")
 
 # 导入Google工具调用处理器
 from tradingagents.agents.utils.google_tool_handler import GoogleToolCallHandler
+from tradingagents.agents.utils.prompt_contract import (
+    get_anti_repetition_rules,
+    get_concise_contract,
+    get_output_schema,
+)
 
 
 def _get_company_name_for_fundamentals(ticker: str, market_info: dict) -> str:
@@ -117,6 +124,7 @@ def create_fundamentals_analyst(llm, toolkit):
 
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
+        expression_profile = state.get("expression_profile", "balanced")
 
         # 🔧 基本面分析数据范围：固定获取10天数据（处理周末/节假日/数据延迟）
         # 参考文档：docs/ANALYST_DATA_CONFIGURATION.md
@@ -163,6 +171,10 @@ def create_fundamentals_analyst(llm, toolkit):
         logger.info(f"📊 [基本面分析师] 使用统一基本面分析工具，自动识别股票类型")
         tools = [toolkit.get_stock_fundamentals_unified]
 
+        concise_contract = get_concise_contract("fundamentals_analyst", expression_profile)
+        output_schema = get_output_schema("fundamentals_analyst")
+        anti_repetition_rules = get_anti_repetition_rules()
+
         # 安全地获取工具名称用于调试
         tool_names_debug = []
         for tool in tools:
@@ -177,58 +189,25 @@ def create_fundamentals_analyst(llm, toolkit):
 
         # 统一的系统提示，适用于所有股票类型
         system_message = (
-            f"你是一位专业的股票基本面分析师。"
-            f"⚠️ 绝对强制要求：你必须调用工具获取真实数据！不允许任何假设或编造！"
-            f"任务：分析{company_name}（股票代码：{ticker}，{market_info['market_name']}）"
-            f"🔴 立即调用 get_stock_fundamentals_unified 工具"
-            f"参数：ticker='{ticker}', start_date='{start_date}', end_date='{current_date}', curr_date='{current_date}'"
-            "📊 分析要求："
-            "- 基于真实数据进行深度基本面分析"
-            f"- 计算并提供合理价位区间（使用{market_info['currency_name']}{market_info['currency_symbol']}）"
-            "- 分析当前股价是否被低估或高估"
-            "- 提供基于基本面的目标价位建议"
-            "- 包含PE、PB、PEG等估值指标分析"
-            "- 结合市场特点进行分析"
-            "🌍 语言和货币要求："
-            "- 所有分析内容必须使用中文"
-            "- 投资建议必须使用中文：买入、持有、卖出"
-            "- 绝对不允许使用英文：buy、hold、sell"
-            f"- 货币单位使用：{market_info['currency_name']}（{market_info['currency_symbol']}）"
-            "🚫 严格禁止："
-            "- 不允许说'我将调用工具'"
-            "- 不允许假设任何数据"
-            "- 不允许编造公司信息"
-            "- 不允许直接回答而不调用工具"
-            "- 不允许回复'无法确定价位'或'需要更多信息'"
-            "- 不允许使用英文投资建议（buy/hold/sell）"
-            "✅ 你必须："
-            "- 立即调用统一基本面分析工具"
-            "- 等待工具返回真实数据"
-            "- 基于真实数据进行分析"
-            "- 提供具体的价位区间和目标价"
-            "- 使用中文投资建议（买入/持有/卖出）"
-            "现在立即开始调用工具！不要说任何其他话！"
+            f"你是一位专业股票基本面分析师，分析目标：{company_name}（{ticker}，{market_info['market_name']}）。\n"
+            f"{concise_contract}\n"
+            f"角色输出模板：{output_schema}\n"
+            f"{anti_repetition_rules}\n"
+            "必须基于工具返回的真实数据分析，禁止假设、编造或跳过工具调用。\n"
+            f"价格和估值单位必须使用 {market_info['currency_name']}（{market_info['currency_symbol']}）。\n"
+            "必须给出明确投资建议（买入/持有/卖出）和具体目标价/区间，不得回答“无法确定”。\n"
         )
 
         # 系统提示模板
         system_prompt = (
-            "🔴 强制要求：你必须调用工具获取真实数据！"
-            "🚫 绝对禁止：不允许假设、编造或直接回答任何问题！"
-            "✅ 工作流程："
-            "1. 【第一次调用】如果消息历史中没有工具结果（ToolMessage），立即调用 get_stock_fundamentals_unified 工具"
-            "2. 【收到数据后】如果消息历史中已经有工具结果（ToolMessage），🚨 绝对禁止再次调用工具！🚨"
-            "3. 【生成报告】收到工具数据后，必须立即生成完整的基本面分析报告，包含："
-            "   - 公司基本信息和财务数据分析"
-            "   - PE、PB、PEG等估值指标分析"
-            "   - 当前股价是否被低估或高估的判断"
-            "   - 合理价位区间和目标价位建议"
-            "   - 基于基本面的投资建议（买入/持有/卖出）"
-            "4. 🚨 重要：工具只需调用一次！一次调用返回所有需要的数据！不要重复调用！🚨"
-            "5. 🚨 如果你已经看到ToolMessage，说明工具已经返回数据，直接生成报告，不要再调用工具！🚨"
-            "可用工具：{tool_names}。\n{system_message}"
-            "当前日期：{current_date}。"
-            "分析目标：{company_name}（股票代码：{ticker}）。"
-            "请确保在分析中正确区分公司名称和股票代码。"
+            "工作流程：\n"
+            "1. 若消息历史中没有工具结果（ToolMessage），立即调用 get_stock_fundamentals_unified，参数："
+            "ticker='{ticker}', start_date='{start_date}', end_date='{current_date}', curr_date='{current_date}'。\n"
+            "2. 若已有ToolMessage，禁止再次调用工具，直接生成完整报告。\n"
+            "3. 工具最多调用一次，收到数据后立即完成分析。\n"
+            "可用工具：{tool_names}。\n"
+            "{system_message}\n"
+            "当前日期：{current_date}。分析目标：{company_name}（股票代码：{ticker}）。"
         )
 
         # 创建提示模板
@@ -252,6 +231,7 @@ def create_fundamentals_analyst(llm, toolkit):
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(ticker=ticker)
         prompt = prompt.partial(company_name=company_name)
+        prompt = prompt.partial(start_date=start_date)
 
         # 检测阿里百炼模型并创建新实例
         if hasattr(llm, '__class__') and 'DashScope' in llm.__class__.__name__:
@@ -307,61 +287,32 @@ def create_fundamentals_analyst(llm, toolkit):
         # 添加详细的股票代码追踪日志
         logger.info(f"🔍 [股票代码追踪] LLM调用前，ticker参数: '{ticker}'")
         logger.info(f"🔍 [股票代码追踪] 传递给LLM的消息数量: {len(state['messages'])}")
+        verbose_prompt_debug = os.getenv("TA_VERBOSE_PROMPT_DEBUG", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
-        # 🔥 打印提交给大模型的完整内容
-        logger.info("=" * 80)
-        logger.info("📝 [提示词调试] 开始打印提交给大模型的完整内容")
-        logger.info("=" * 80)
-
-        # 1. 打印系统提示词
-        logger.info("📋 [提示词调试] 1️⃣ 系统提示词 (System Message):")
-        logger.info("-" * 80)
-        logger.info(system_message)
-        logger.info("-" * 80)
-
-        # 2. 打印完整的提示模板
-        logger.info("📋 [提示词调试] 2️⃣ 完整提示模板 (Prompt Template):")
-        logger.info("-" * 80)
-        logger.info(f"工具名称: {', '.join(tool_names)}")
-        logger.info(f"当前日期: {current_date}")
-        logger.info(f"股票代码: {ticker}")
-        logger.info(f"公司名称: {company_name}")
-        logger.info("-" * 80)
-
-        # 3. 打印消息历史
-        logger.info("📋 [提示词调试] 3️⃣ 消息历史 (Message History):")
-        logger.info("-" * 80)
-        for i, msg in enumerate(state['messages']):
-            msg_type = type(msg).__name__
-            if hasattr(msg, 'content'):
-                # 🔥 调试模式：打印完整内容，不截断
-                content_full = str(msg.content)
-                logger.info(f"消息 {i+1} [{msg_type}]:")
-                logger.info(f"  内容长度: {len(content_full)} 字符")
-                logger.info(f"  内容: {content_full}")
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                logger.info(f"  工具调用: {[tc.get('name', 'unknown') for tc in msg.tool_calls]}")
-            if hasattr(msg, 'name'):
-                logger.info(f"  工具名称: {msg.name}")
-            logger.info("-" * 40)
-        logger.info("-" * 80)
-
-        # 4. 打印绑定的工具信息
-        logger.info("📋 [提示词调试] 4️⃣ 绑定的工具 (Bound Tools):")
-        logger.info("-" * 80)
-        for i, tool in enumerate(tools):
-            tool_name = getattr(tool, 'name', None) or getattr(tool, '__name__', 'unknown')
-            tool_desc = getattr(tool, 'description', 'No description')
-            logger.info(f"工具 {i+1}: {tool_name}")
-            logger.info(f"  描述: {tool_desc}")
-            if hasattr(tool, 'args_schema'):
-                logger.info(f"  参数: {tool.args_schema}")
-            logger.info("-" * 40)
-        logger.info("-" * 80)
-
-        logger.info("=" * 80)
-        logger.info("📝 [提示词调试] 完整内容打印结束，开始调用LLM")
-        logger.info("=" * 80)
+        logger.info(
+            "📝 [提示词调试] 摘要: system_len=%s, tools=%s, messages=%s, concise_mode=%s",
+            len(system_message),
+            ", ".join(tool_names),
+            len(state["messages"]),
+            os.getenv("TA_PROMPT_CONCISE_MODE", "true"),
+        )
+        if verbose_prompt_debug:
+            logger.debug("📝 [提示词调试] 系统提示词全文:\n%s", system_message)
+            for i, msg in enumerate(state["messages"]):
+                msg_type = type(msg).__name__
+                msg_content = str(getattr(msg, "content", msg))
+                logger.debug(
+                    "📝 [提示词调试] 消息%s type=%s len=%s content=%s",
+                    i + 1,
+                    msg_type,
+                    len(msg_content),
+                    msg_content,
+                )
 
         # 修复：传递字典而不是直接传递消息列表，以便 ChatPromptTemplate 能正确处理所有变量
         result = chain.invoke({"messages": state["messages"]})
@@ -371,10 +322,8 @@ def create_fundamentals_analyst(llm, toolkit):
         logger.info(f"🤖 [基本面分析师] AIMessage详细内容:")
         logger.info(f"🤖 [基本面分析师] - 消息类型: {type(result).__name__}")
         logger.info(f"🤖 [基本面分析师] - 内容长度: {len(result.content) if hasattr(result, 'content') else 0}")
-        if hasattr(result, 'content') and result.content:
-            # 🔥 调试模式：打印完整内容，不截断
-            logger.info(f"🤖 [基本面分析师] - 完整内容:")
-            logger.info(f"{result.content}")
+        if verbose_prompt_debug and hasattr(result, 'content') and result.content:
+            logger.debug(f"🤖 [基本面分析师] - 完整内容:\n{result.content}")
         
         # 🔍 [调试日志] 打印tool_calls的详细信息
         # 详细记录 LLM 返回结果

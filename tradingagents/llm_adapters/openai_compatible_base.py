@@ -18,6 +18,10 @@ from tradingagents.utils.logging_init import setup_llm_logging
 from tradingagents.utils.logging_manager import get_logger, get_logger_manager
 logger = get_logger('agents')
 logger = setup_llm_logging()
+from tradingagents.llm_adapters.token_usage_context import (
+    get_current_analysis_type,
+    get_current_session_id,
+)
 
 # 导入token跟踪器
 try:
@@ -169,8 +173,10 @@ class OpenAICompatibleBase(ChatOpenAI):
         # 调用父类生成方法
         result = super()._generate(messages, stop, run_manager, **kwargs)
         
-        # 记录token使用
-        self._track_token_usage(result, kwargs, start_time)
+        # 记录token使用（把输入消息一并传入，便于估算兜底）
+        track_kwargs = dict(kwargs)
+        track_kwargs["messages"] = messages
+        self._track_token_usage(result, track_kwargs, start_time)
         
         return result
 
@@ -179,19 +185,119 @@ class OpenAICompatibleBase(ChatOpenAI):
         if not TOKEN_TRACKING_ENABLED:
             return
         try:
-            # 统计token信息
-            usage = getattr(result, "usage_metadata", None)
-            total_tokens = usage.get("total_tokens") if usage else None
-            prompt_tokens = usage.get("input_tokens") if usage else None
-            completion_tokens = usage.get("output_tokens") if usage else None
+            prompt_tokens, completion_tokens, total_tokens = self._extract_token_usage(result)
+            if prompt_tokens is None or completion_tokens is None:
+                est_prompt, est_completion = self._estimate_token_usage(result, kwargs)
+                prompt_tokens = prompt_tokens if prompt_tokens is not None else est_prompt
+                completion_tokens = completion_tokens if completion_tokens is not None else est_completion
+                total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+            elif total_tokens is None:
+                total_tokens = prompt_tokens + completion_tokens
+
+            session_id = kwargs.get("session_id") or get_current_session_id() or f"{getattr(self, 'provider_name', 'unknown')}_{int(start_time*1000)}"
+            analysis_type = kwargs.get("analysis_type") or get_current_analysis_type()
 
             elapsed = time.time() - start_time
             logger.info(
                 f"📊 Token使用 - Provider: {getattr(self, 'provider_name', 'unknown')}, Model: {getattr(self, 'model_name', 'unknown')}, "
                 f"总tokens: {total_tokens}, 提示: {prompt_tokens}, 补全: {completion_tokens}, 用时: {elapsed:.2f}s"
             )
+
+            if (prompt_tokens or 0) > 0 or (completion_tokens or 0) > 0:
+                usage_record = token_tracker.track_usage(
+                    provider=getattr(self, "provider_name", "unknown"),
+                    model_name=getattr(self, "model_name", "unknown"),
+                    input_tokens=int(prompt_tokens or 0),
+                    output_tokens=int(completion_tokens or 0),
+                    session_id=session_id,
+                    analysis_type=analysis_type,
+                )
+                if usage_record:
+                    logger_manager = get_logger_manager()
+                    logger_manager.log_token_usage(
+                        logger,
+                        getattr(self, "provider_name", "unknown"),
+                        getattr(self, "model_name", "unknown"),
+                        int(prompt_tokens or 0),
+                        int(completion_tokens or 0),
+                        usage_record.cost,
+                        session_id,
+                    )
         except Exception as e:
             logger.warning(f"⚠️ Token跟踪记录失败: {e}")
+
+    def _extract_token_usage(self, result: ChatResult) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        prompt_tokens = None
+        completion_tokens = None
+        total_tokens = None
+
+        # 路径1: ChatResult.usage_metadata
+        usage = getattr(result, "usage_metadata", None)
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
+            completion_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+
+        # 路径2: ChatResult.llm_output.token_usage / usage
+        llm_output = getattr(result, "llm_output", None)
+        if isinstance(llm_output, dict):
+            token_usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+            if isinstance(token_usage, dict):
+                prompt_tokens = prompt_tokens or token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+                completion_tokens = completion_tokens or token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+                total_tokens = total_tokens or token_usage.get("total_tokens")
+
+        # 路径3: generation.message.response_metadata
+        for generation in getattr(result, "generations", []) or []:
+            generation_items = generation if isinstance(generation, list) else [generation]
+            for item in generation_items:
+                message = getattr(item, "message", None)
+                response_meta = getattr(message, "response_metadata", None) if message else None
+                if not isinstance(response_meta, dict):
+                    continue
+                token_usage = response_meta.get("token_usage") or response_meta.get("usage_metadata") or response_meta.get("usage") or {}
+                if isinstance(token_usage, dict):
+                    prompt_tokens = prompt_tokens or token_usage.get("prompt_tokens") or token_usage.get("input_tokens")
+                    completion_tokens = completion_tokens or token_usage.get("completion_tokens") or token_usage.get("output_tokens")
+                    total_tokens = total_tokens or token_usage.get("total_tokens")
+                if prompt_tokens is None:
+                    prompt_tokens = response_meta.get("prompt_tokens") or response_meta.get("input_tokens")
+                if completion_tokens is None:
+                    completion_tokens = response_meta.get("completion_tokens") or response_meta.get("output_tokens")
+                if total_tokens is None:
+                    total_tokens = response_meta.get("total_tokens")
+
+        return self._as_int(prompt_tokens), self._as_int(completion_tokens), self._as_int(total_tokens)
+
+    @staticmethod
+    def _as_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _estimate_token_usage(self, result: ChatResult, kwargs: Dict[str, Any]) -> tuple[int, int]:
+        messages = kwargs.get("messages")
+        prompt_chars = 0
+        if isinstance(messages, list):
+            for msg in messages:
+                prompt_chars += len(str(getattr(msg, "content", msg)))
+        prompt_tokens = max(1, prompt_chars // 2) if prompt_chars else 0
+
+        completion_chars = 0
+        for generation in getattr(result, "generations", []) or []:
+            generation_items = generation if isinstance(generation, list) else [generation]
+            for item in generation_items:
+                message = getattr(item, "message", None)
+                if message is not None:
+                    completion_chars += len(str(getattr(message, "content", "")))
+                else:
+                    completion_chars += len(str(getattr(item, "text", "")))
+
+        completion_tokens = max(1, completion_chars // 2) if completion_chars else 0
+        return prompt_tokens, completion_tokens
 
 
 class ChatDeepSeekOpenAI(OpenAICompatibleBase):

@@ -190,25 +190,37 @@ async def init_database():
     """初始化数据库连接"""
     global mongo_client, mongo_db, redis_client, redis_pool
 
+    mongodb_ready = False
+    redis_ready = False
+
+    # MongoDB 初始化失败时不阻塞服务启动，运行时按需降级。
     try:
-        # 初始化MongoDB
         await db_manager.init_mongodb()
         mongo_client = db_manager.mongo_client
         mongo_db = db_manager.mongo_db
+        mongodb_ready = True
+    except Exception as e:
+        logger.warning(f"⚠️ MongoDB 初始化失败，服务将以降级模式启动: {e}")
 
-        # 初始化Redis
+    # Redis 初始化失败时不阻塞服务启动，运行时按需降级。
+    try:
         await db_manager.init_redis()
         redis_client = db_manager.redis_client
         redis_pool = db_manager.redis_pool
-
-        logger.info("🎉 所有数据库连接初始化完成")
-
-        # 🔥 初始化数据库视图和索引
-        await init_database_views_and_indexes()
-
+        redis_ready = True
     except Exception as e:
-        logger.error(f"💥 数据库初始化失败: {e}")
-        raise
+        logger.warning(f"⚠️ Redis 初始化失败，服务将以降级模式启动: {e}")
+
+    if mongodb_ready:
+        await init_database_views_and_indexes()
+    else:
+        logger.info("ℹ️ 跳过数据库视图和索引初始化（MongoDB 不可用）")
+
+    logger.info(
+        "🎉 数据库初始化完成（可降级） - MongoDB: %s, Redis: %s",
+        "OK" if mongodb_ready else "UNAVAILABLE",
+        "OK" if redis_ready else "UNAVAILABLE",
+    )
 
 
 async def init_database_views_and_indexes():

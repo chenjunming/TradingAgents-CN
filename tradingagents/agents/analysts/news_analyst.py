@@ -12,6 +12,11 @@ from tradingagents.tools.unified_news_tool import create_unified_news_tool
 from tradingagents.utils.stock_utils import StockUtils
 # 导入Google工具调用处理器
 from tradingagents.agents.utils.google_tool_handler import GoogleToolCallHandler
+from tradingagents.agents.utils.prompt_contract import (
+    get_anti_repetition_rules,
+    get_concise_contract,
+    get_output_schema,
+)
 
 logger = get_logger("analysts.news")
 
@@ -28,6 +33,7 @@ def create_news_analyst(llm, toolkit):
 
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
+        expression_profile = state.get("expression_profile", "balanced")
 
         logger.info(f"[新闻分析师] 开始分析 {ticker} 的新闻，交易日期: {current_date}")
         session_id = state.get("session_id", "未知会话")
@@ -104,24 +110,27 @@ def create_news_analyst(llm, toolkit):
         tools = [unified_news_tool]
         logger.info(f"[新闻分析师] 已加载统一新闻工具: get_stock_news_unified")
 
+        concise_contract = get_concise_contract("news_analyst", expression_profile)
+        output_schema = get_output_schema("news_analyst")
+        anti_repetition_rules = get_anti_repetition_rules()
+
         system_message = (
-            "你是专业财经新闻分析师。基于真实新闻数据输出中文分析，"
-            "聚焦时效性、可信度、事件影响、市场情绪与风险。"
-            "必须给出短中期影响判断与可执行建议，并在末尾附关键结论表格。"
-            "若新闻滞后超过2小时，要明确说明时效性限制。"
+            "你是专业财经新闻分析师。基于真实新闻数据输出中文分析，聚焦时效性、可信度、事件影响、市场情绪与风险。\n"
+            f"{concise_contract}\n"
+            f"角色输出模板：{output_schema}\n"
+            f"{anti_repetition_rules}\n"
+            "必须给出短中期影响判断与可执行建议；若新闻滞后超过2小时，明确说明时效性限制。"
         )
 
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    "你是专业财经新闻分析师。"
-                    "\n必须先调用 get_stock_news_unified 获取真实新闻，再基于返回数据分析。"
-                    "\n禁止编造、猜测、跳过工具调用。"
-                    "\n您可以访问以下工具：{tool_names}。"
-                    "\n{system_message}"
-                    "\n供您参考，当前日期是{current_date}。我们正在查看公司{ticker}。"
-                    "\n请按照上述要求执行，用中文撰写所有分析内容。",
+                    "你是专业财经新闻分析师。\n"
+                    "必须先调用 get_stock_news_unified 获取真实新闻，再基于返回数据分析。\n"
+                    "禁止编造、猜测、跳过工具调用。工具：{tool_names}。\n"
+                    "{system_message}\n"
+                    "当前日期{current_date}，分析标的{ticker}。请用中文完成分析。",
                 ),
                 MessagesPlaceholder(variable_name="messages"),
             ]
@@ -166,33 +175,25 @@ def create_news_analyst(llm, toolkit):
 
                     # 直接基于预获取的新闻生成分析，跳过工具调用
                     # 🔧 重要：构建不包含工具调用指导的系统提示词
-                    analysis_system_prompt = f"""您是一位专业的财经新闻分析师。
-
-您的职责是基于提供的新闻数据，对股票进行深入的新闻分析。
-
-分析要点：
-1. 总结最新的新闻事件和市场动态
-2. 分析新闻对股票的潜在影响
-3. 评估市场情绪和投资者反应
-4. 提供基于新闻的投资建议
-
-重要说明：新闻数据已经为您提供，您无需调用任何工具，直接基于提供的数据进行分析。"""
+                    analysis_system_prompt = (
+                        "您是一位专业财经新闻分析师。\n"
+                        f"{concise_contract}\n"
+                        f"角色输出模板：{output_schema}\n"
+                        f"{anti_repetition_rules}\n"
+                        "新闻数据已提供，无需调用工具，直接基于数据分析。"
+                    )
 
                     prefetched_limit = 3000
                     news_payload = str(pre_fetched_news or "")
                     if len(news_payload) > prefetched_limit:
                         news_payload = news_payload[:prefetched_limit] + "\n...(新闻内容已截断)"
 
-                    enhanced_prompt = f"""请基于以下已获取的最新新闻数据，对股票 {ticker}（{company_name}）进行详细的新闻分析：
+                    enhanced_prompt = f"""请基于以下新闻数据，对股票 {ticker}（{company_name}）输出精炼分析。
 
 === 最新新闻数据 ===
 {news_payload}
 
-请撰写详细的中文分析报告，包括：
-1. 新闻事件总结
-2. 对股票的影响分析
-3. 市场情绪评估
-4. 投资建议"""
+请严格按以下结构输出：{output_schema}"""
 
                     logger.info(f"[新闻分析师] 🔄 使用预获取新闻数据直接生成分析...")
                     logger.info(f"[新闻分析师] 📝 系统提示词长度: {len(analysis_system_prompt)} 字符")

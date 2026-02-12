@@ -12,6 +12,11 @@ logger = get_logger("default")
 
 # 导入Google工具调用处理器
 from tradingagents.agents.utils.google_tool_handler import GoogleToolCallHandler
+from tradingagents.agents.utils.prompt_contract import (
+    get_anti_repetition_rules,
+    get_concise_contract,
+    get_output_schema,
+)
 
 
 def _get_company_name(ticker: str, market_info: dict) -> str:
@@ -104,6 +109,7 @@ def create_market_analyst(llm, toolkit):
 
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
+        expression_profile = state.get("expression_profile", "balanced")
 
         logger.debug(f"📈 [DEBUG] 输入参数: ticker={ticker}, date={current_date}")
         logger.debug(f"📈 [DEBUG] 当前状态中的消息数量: {len(state.get('messages', []))}")
@@ -137,57 +143,26 @@ def create_market_analyst(llm, toolkit):
         logger.info(f"📊 [市场分析师] 绑定的工具: {tool_names_debug}")
         logger.info(f"📊 [市场分析师] 目标市场: {market_info['market_name']}")
 
-        # 🔥 优化：将输出格式要求放在系统提示的开头，确保LLM遵循格式
+        concise_contract = get_concise_contract("market_analyst", expression_profile)
+        output_schema = get_output_schema("market_analyst")
+        anti_repetition_rules = get_anti_repetition_rules()
+
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
                     "system",
-                    "你是一位专业的股票技术分析师，与其他分析师协作。\n"
-                    "\n"
-                    "📋 **分析对象：**\n"
-                    "- 公司名称：{company_name}\n"
-                    "- 股票代码：{ticker}\n"
-                    "- 所属市场：{market_name}\n"
-                    "- 计价货币：{currency_name}（{currency_symbol}）\n"
-                    "- 分析日期：{current_date}\n"
-                    "\n"
-                    "🔧 **工具使用：**\n"
-                    "你可以使用以下工具：{tool_names}\n"
-                    "⚠️ 重要工作流程：\n"
-                    "1. 如果消息历史中没有工具结果，立即调用 get_stock_market_data_unified 工具\n"
-                    "   - ticker: {ticker}\n"
-                    "   - start_date: {current_date}\n"
-                    "   - end_date: {current_date}\n"
-                    "   注意：系统会自动扩展到365天历史数据，你只需要传递当前分析日期即可\n"
-                    "2. 如果消息历史中已经有工具结果（ToolMessage），立即基于工具数据生成最终分析报告\n"
-                    "3. 不要重复调用工具！一次工具调用就足够了！\n"
-                    "4. 接收到工具数据后，必须立即生成完整的技术分析报告，不要再调用任何工具\n"
-                    "\n"
-                    "📝 **输出格式要求（必须严格遵守）：**\n"
-                    "\n"
-                    "## 📊 股票基本信息\n"
-                    "- 公司名称：{company_name}\n"
-                    "- 股票代码：{ticker}\n"
-                    "- 所属市场：{market_name}\n"
-                    "\n"
-                    "## 📈 技术指标分析\n"
-                    "[在这里分析移动平均线、MACD、RSI、布林带等技术指标，提供具体数值]\n"
-                    "\n"
-                    "## 📉 价格趋势分析\n"
-                    "[在这里分析价格趋势，考虑{market_name}市场特点]\n"
-                    "\n"
-                    "## 💭 投资建议\n"
-                    "[在这里给出明确的投资建议：买入/持有/卖出]\n"
-                    "\n"
-                    "⚠️ **重要提醒：**\n"
-                    "- 必须使用上述格式输出，不要自创标题格式\n"
-                    "- 所有价格数据使用{currency_name}（{currency_symbol}）表示\n"
-                    "- 确保在分析中正确使用公司名称\"{company_name}\"和股票代码\"{ticker}\"\n"
-                    "- 不要在标题中使用\"技术分析报告\"等自创标题\n"
-                    "- 如果你有明确的技术面投资建议（买入/持有/卖出），请在投资建议部分明确标注\n"
-                    "- 不要使用'最终交易建议'前缀，因为最终决策需要综合所有分析师的意见\n"
-                    "\n"
-                    "请使用中文，基于真实数据进行分析。",
+                    "你是一位专业股票技术分析师，与其他分析师协作。\n"
+                    "{concise_contract}\n"
+                    "角色输出模板：{output_schema}\n"
+                    "{anti_repetition_rules}\n"
+                    "分析对象：公司{company_name}，代码{ticker}，市场{market_name}，货币{currency_name}（{currency_symbol}），日期{current_date}。\n"
+                    "可用工具：{tool_names}。\n"
+                    "工作流程：\n"
+                    "1. 若消息历史没有工具结果（ToolMessage），立即调用 get_stock_market_data_unified，参数 ticker={ticker}, start_date={current_date}, end_date={current_date}。\n"
+                    "2. 若已有工具结果，直接基于数据生成完整报告，不得再次调用工具。\n"
+                    "3. 工具最多调用一次，收到数据后立即完成分析。\n"
+                    "输出要求：必须给出明确建议（买入/持有/卖出）；仅保留关键指标数字与时间点；必须覆盖主要反向风险。\n"
+                    "请使用中文，基于真实数据分析。",
                 ),
                 MessagesPlaceholder(variable_name="messages"),
             ]
@@ -211,6 +186,9 @@ def create_market_analyst(llm, toolkit):
         prompt = prompt.partial(market_name=market_info['market_name'])
         prompt = prompt.partial(currency_name=market_info['currency_name'])
         prompt = prompt.partial(currency_symbol=market_info['currency_symbol'])
+        prompt = prompt.partial(concise_contract=concise_contract)
+        prompt = prompt.partial(output_schema=output_schema)
+        prompt = prompt.partial(anti_repetition_rules=anti_repetition_rules)
 
         # 添加详细日志
         logger.info(f"📊 [市场分析师] LLM类型: {llm.__class__.__name__}")

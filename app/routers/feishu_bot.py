@@ -111,6 +111,7 @@ def _help_text() -> str:
         "/pick - 候选股票建议\n"
         "/rebalance - 调仓建议\n"
         "/position (/pos) - 当前持仓\n"
+        "/total [list|set|clear] [A股|港股|美股] [金额] - 设置/查看仓位分母总仓\n"
         "/reportpos [数量] [A股,港股,美股] [快速|基础|标准|深度|全面] [force] - 基于当前持仓批量发起个股分析\n"
         "/syncpos [symbols] - 同步长桥持仓到纸上账户（可选指定标的，逗号分隔）\n"
         "/feedback [YYYY-MM] - 查看持续评估统计（胜率/回撤/归因）\n"
@@ -220,6 +221,76 @@ def _infer_currency(market: str, raw_currency: Optional[str]) -> str:
     if market == "US":
         return "USD"
     return "CNY"
+
+
+def _get_market_total_override(market: str) -> Optional[float]:
+    """从环境变量读取手动总仓（按市场），如 FEISHU_POSITION_TOTAL_US=100000。"""
+    for key in (f"FEISHU_POSITION_TOTAL_{market}", f"POSITION_TOTAL_{market}"):
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        try:
+            val = float(str(raw).strip())
+            if val > 0:
+                return val
+        except Exception:
+            continue
+    return None
+
+
+async def _load_user_position_totals(user_id: str) -> Dict[str, float]:
+    """Load per-user market totals from MongoDB."""
+    try:
+        db = get_mongo_db()
+        doc = await db.feishu_position_totals.find_one(
+            {"user_id": user_id},
+            {"_id": 0, "totals": 1},
+        )
+    except Exception:
+        return {}
+
+    totals = doc.get("totals") if isinstance(doc, dict) else {}
+    if not isinstance(totals, dict):
+        return {}
+
+    result: Dict[str, float] = {}
+    for mk in ("CN", "HK", "US"):
+        raw = totals.get(mk)
+        try:
+            val = float(raw)
+            if val > 0:
+                result[mk] = val
+        except Exception:
+            continue
+    return result
+
+
+async def _set_user_position_total(user_id: str, market: str, amount: float) -> None:
+    db = get_mongo_db()
+    now = datetime.utcnow()
+    await db.feishu_position_totals.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                f"totals.{market}": float(amount),
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "user_id": user_id,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+
+async def _clear_user_position_total(user_id: str, market: str) -> bool:
+    db = get_mongo_db()
+    result = await db.feishu_position_totals.update_one(
+        {"user_id": user_id},
+        {"$unset": {f"totals.{market}": ""}, "$set": {"updated_at": datetime.utcnow()}},
+    )
+    return bool(result.matched_count)
 
 
 async def _load_position_quote_map(positions: List[UnifiedPosition]) -> Dict[str, Dict[str, Optional[float]]]:
@@ -348,6 +419,7 @@ async def _collect_positions_snapshot(user_id: str) -> Dict[str, Any]:
     if not positions:
         return result
 
+    user_totals = await _load_user_position_totals(user_id)
     quote_map = await _load_position_quote_map(positions)
     allowed_markets = set(order)
 
@@ -380,6 +452,16 @@ async def _collect_positions_snapshot(user_id: str) -> Dict[str, Any]:
                 day_pnl = (float(current_price) - float(q_pre_close)) * qty
             except Exception:
                 day_pnl = None
+        # 回退口径：部分港美数据源仅返回涨跌幅，不返回昨收
+        # 由 pct = (P/P0 - 1) 反推 P0，避免“当日盈亏金额”显示为 -
+        if day_pnl is None and current_price is not None and day_pct is not None:
+            try:
+                pct_val = float(day_pct)
+                denom = 100.0 + pct_val
+                if abs(denom) > 1e-8:
+                    day_pnl = float(current_price) * qty * (pct_val / denom)
+            except Exception:
+                day_pnl = None
 
         market_value = _safe_float(p.market_value)
         if market_value is None and current_price is not None:
@@ -408,6 +490,7 @@ async def _collect_positions_snapshot(user_id: str) -> Dict[str, Any]:
                 "pre_close": q_pre_close,
                 "day_pnl": day_pnl,
                 "market_value": market_value,
+                "cost_total": cost_total,
                 "pnl": pnl,
                 "pnl_pct": pnl_pct,
                 "currency": currency,
@@ -415,11 +498,14 @@ async def _collect_positions_snapshot(user_id: str) -> Dict[str, Any]:
         )
 
     market_total_mv: Dict[str, float] = {}
+    market_total_cost: Dict[str, float] = {}
     for item in enriched:
         mv = item.get("market_value")
-        if mv is None:
-            continue
-        market_total_mv[item["market"]] = market_total_mv.get(item["market"], 0.0) + float(mv)
+        if mv is not None:
+            market_total_mv[item["market"]] = market_total_mv.get(item["market"], 0.0) + float(mv)
+        cost_val = item.get("cost_total")
+        if cost_val is not None:
+            market_total_cost[item["market"]] = market_total_cost.get(item["market"], 0.0) + float(cost_val)
 
     for mk in order:
         rows = [x for x in enriched if x["market"] == mk]
@@ -430,11 +516,24 @@ async def _collect_positions_snapshot(user_id: str) -> Dict[str, Any]:
         day_pnl_sum = sum((x.get("day_pnl") or 0.0) for x in rows if x.get("day_pnl") is not None)
 
         cur = rows[0]["currency"] if rows else _infer_currency(mk, None)
+        total_override = user_totals.get(mk)
+        if total_override is None:
+            total_override = _get_market_total_override(mk)
+        denom = market_total_mv.get(mk, 0.0)
+        if total_override is not None:
+            denom = float(total_override)
+        elif denom <= 0:
+            denom = market_total_cost.get(mk, 0.0)
+
         for x in rows:
             weight = None
             mv = x.get("market_value")
-            if mv is not None and market_total_mv.get(mk, 0.0) > 0:
-                weight = float(mv) / market_total_mv[mk] * 100.0
+            if mv is not None and denom > 0:
+                weight = float(mv) / denom * 100.0
+            elif mv is None and denom > 0:
+                cost_val = x.get("cost_total")
+                if cost_val is not None:
+                    weight = float(cost_val) / denom * 100.0
             x["weight_pct"] = weight
 
         result["groups"][mk] = {
@@ -500,7 +599,7 @@ def _build_positions_snapshot_card(snapshot: Dict[str, Any]) -> Dict[str, Any]:
             )
         md_lines.append("")
 
-    md_lines.append("注：仓位为市场内占比；浮盈亏基于成本价与最新价估算。")
+    md_lines.append("注：仓位优先按市值计算；可用 /total 或 FEISHU_POSITION_TOTAL_{CN/HK/US} 设置总仓；无行情时回退成本口径。")
     markdown_content = "\n".join(md_lines).strip() or "暂无持仓"
 
     return {
@@ -558,7 +657,7 @@ def _render_positions_snapshot_text(snapshot: Dict[str, Any]) -> str:
             )
         lines.append("")
 
-    lines.append("注: 仓位为市场内占比；浮盈亏基于成本价与最新价估算。")
+    lines.append("注: 仓位优先按市值计算；可用 /total 或 FEISHU_POSITION_TOTAL_{CN/HK/US} 设置总仓；无行情时回退成本口径。")
     return "\n".join(lines)
 
 
@@ -4039,8 +4138,8 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         )
         return ok({"reply": reply})
 
-    if command not in {"/daily", "/pick", "/rebalance", "/position", "/pos", "/reportpos", "/syncpos", "/feedback", "/history", "/wl", "/report", "/reportid", "/screen"}:
-        reply = "支持命令: /help /daily /pick /rebalance /position(/pos) /reportpos /syncpos /feedback /history /report /reportid /screen /wl /confirm /cancel"
+    if command not in {"/daily", "/pick", "/rebalance", "/position", "/pos", "/total", "/reportpos", "/syncpos", "/feedback", "/history", "/wl", "/report", "/reportid", "/screen"}:
+        reply = "支持命令: /help /daily /pick /rebalance /position(/pos) /total /reportpos /syncpos /feedback /history /report /reportid /screen /wl /confirm /cancel"
         if chat_id:
             await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
         return ok({"reply": reply})
@@ -4062,6 +4161,51 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
             chat_id=chat_id,
             reply_to_message_id=reply_to_message_id,
         )
+    elif command == "/total":
+        if not args or args[0].lower() in {"list", "ls", "show"}:
+            totals = await _load_user_position_totals(user_id)
+            lines = ["当前总仓设置："]
+            for mk in ["CN", "HK", "US"]:
+                val = totals.get(mk)
+                source = "机器人"
+                if val is None:
+                    val = _get_market_total_override(mk)
+                    source = ".env" if val is not None else "-"
+                amount_text = "-" if val is None else _fmt_money(val, _infer_currency(mk, None))
+                lines.append(f"- {_market_label(mk)}: {amount_text} (来源: {source})")
+            lines.append("用法: /total set 美股 300000 | /total clear 美股 | /total list")
+            reply = "\n".join(lines)
+        else:
+            op = str(args[0] or "").strip().lower()
+            if op in {"clear", "del", "rm", "remove"}:
+                if len(args) < 2:
+                    reply = "用法: /total clear A股|港股|美股"
+                else:
+                    mk = _normalize_market_token(args[1])
+                    if not mk:
+                        reply = "市场仅支持: A股/港股/美股"
+                    else:
+                        await _clear_user_position_total(user_id, mk)
+                        reply = f"已清除 {_market_label(mk)} 总仓设置（会回退到 .env 或自动口径）"
+            else:
+                idx = 0
+                if op in {"set", "add", "update"}:
+                    idx = 1
+                if len(args) <= idx + 1:
+                    reply = "用法: /total set A股|港股|美股 金额"
+                else:
+                    mk = _normalize_market_token(args[idx])
+                    if not mk:
+                        reply = "市场仅支持: A股/港股/美股"
+                    else:
+                        try:
+                            amount = float(str(args[idx + 1]).replace(",", "").strip())
+                            if amount <= 0:
+                                raise ValueError("金额必须大于0")
+                            await _set_user_position_total(user_id, mk, amount)
+                            reply = f"已设置 {_market_label(mk)} 总仓: {_fmt_money(amount, _infer_currency(mk, None))}"
+                        except Exception as exc:
+                            reply = f"设置失败: {exc}"
     elif command == "/reportpos":
         limit, market_codes, depth, force_refresh = _parse_reportpos_args(args)
         reply, _ = await _start_batch_analysis_from_positions(

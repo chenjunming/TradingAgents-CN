@@ -42,6 +42,7 @@ from app.services.config_provider import provider as config_provider
 from app.services.queue import DEFAULT_USER_CONCURRENT_LIMIT, GLOBAL_CONCURRENT_LIMIT, VISIBILITY_TIMEOUT_SECONDS
 from app.services.usage_statistics_service import UsageStatisticsService
 from app.models.config import UsageRecord
+from tradingagents.llm_adapters.token_usage_context import token_usage_context
 
 import logging
 logger = logging.getLogger(__name__)
@@ -59,6 +60,40 @@ class AnalysisService:
         self._trading_graph_cache = {}
         # 进度跟踪器缓存
         self._progress_trackers: Dict[str, RedisProgressTracker] = {}
+
+    def _get_token_usage_summary_sync(self, session_id: str) -> Dict[str, int]:
+        summary = {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+        if not session_id:
+            return summary
+
+        try:
+            from pymongo import MongoClient
+            from app.core.config import settings
+
+            client = MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=4000)
+            db = client[settings.MONGO_DB]
+            cursor = db.token_usage.find(
+                {"session_id": session_id},
+                {"_id": 0, "input_tokens": 1, "output_tokens": 1},
+            )
+            for doc in cursor:
+                input_tokens = int(doc.get("input_tokens", 0) or 0)
+                output_tokens = int(doc.get("output_tokens", 0) or 0)
+                summary["requests"] += 1
+                summary["prompt_tokens"] += input_tokens
+                summary["completion_tokens"] += output_tokens
+
+            summary["total_tokens"] = summary["prompt_tokens"] + summary["completion_tokens"]
+            client.close()
+        except Exception as e:
+            logger.warning(f"⚠️ token汇总失败 session={session_id}: {e}")
+
+        return summary
 
     def _convert_user_id(self, user_id: str) -> PyObjectId:
         """将字符串用户ID转换为PyObjectId"""
@@ -190,7 +225,8 @@ class AnalysisService:
                 llm_provider=llm_provider,
                 market_type=getattr(task.parameters, 'market_type', "A股"),
                 quick_model_config=quick_model_config,  # 传递模型配置
-                deep_model_config=deep_model_config     # 传递模型配置
+                deep_model_config=deep_model_config,    # 传递模型配置
+                expression_profile=getattr(task.parameters, "expression_profile", "balanced"),
             )
 
             # 启动引擎
@@ -209,7 +245,14 @@ class AnalysisService:
                 progress_tracker.update_progress(message)
 
             # 调用现有的分析方法（同步调用，传递进度回调）
-            _, decision = trading_graph.propagate(task.symbol, analysis_date, progress_callback)
+            with token_usage_context(session_id=task.task_id, analysis_type="stock_analysis"):
+                _, decision = trading_graph.propagate(task.symbol, analysis_date, progress_callback)
+
+            token_summary = self._get_token_usage_summary_sync(task.task_id)
+            total_tokens_used = token_summary.get("total_tokens", 0)
+            if isinstance(decision, dict):
+                decision["tokens_used"] = total_tokens_used
+                decision["token_usage"] = token_summary
 
             execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
 
@@ -229,7 +272,7 @@ class AnalysisService:
                 key_points=decision.get("key_points", []),
                 detailed_analysis=decision,
                 execution_time=execution_time,
-                tokens_used=decision.get("tokens_used", 0),
+                tokens_used=total_tokens_used,
                 model_info=model_info  # 🔥 添加模型信息字段
             )
 
@@ -315,7 +358,8 @@ class AnalysisService:
                 llm_provider=llm_provider,
                 market_type=getattr(task.parameters, 'market_type', "A股"),
                 quick_model_config=quick_model_config,  # 传递模型配置
-                deep_model_config=deep_model_config     # 传递模型配置
+                deep_model_config=deep_model_config,    # 传递模型配置
+                expression_profile=getattr(task.parameters, "expression_profile", "balanced"),
             )
 
             # 获取TradingAgents实例
@@ -327,7 +371,14 @@ class AnalysisService:
             analysis_date = task.parameters.analysis_date or datetime.now().strftime("%Y-%m-%d")
 
             # 调用现有的分析方法（同步调用）
-            _, decision = trading_graph.propagate(task.symbol, analysis_date)
+            with token_usage_context(session_id=task.task_id, analysis_type="stock_analysis"):
+                _, decision = trading_graph.propagate(task.symbol, analysis_date)
+
+            token_summary = self._get_token_usage_summary_sync(task.task_id)
+            total_tokens_used = token_summary.get("total_tokens", 0)
+            if isinstance(decision, dict):
+                decision["tokens_used"] = total_tokens_used
+                decision["token_usage"] = token_summary
 
             execution_time = (datetime.now(timezone.utc) - start_time).total_seconds()
 
@@ -344,7 +395,7 @@ class AnalysisService:
                 key_points=decision.get("key_points", []),
                 detailed_analysis=decision,
                 execution_time=execution_time,
-                tokens_used=decision.get("tokens_used", 0),
+                tokens_used=total_tokens_used,
                 model_info=model_info  # 🔥 添加模型信息字段
             )
 
@@ -691,7 +742,8 @@ class AnalysisService:
                 llm_provider=llm_provider,
                 market_type=getattr(task.parameters, 'market_type', "A股"),
                 quick_model_config=quick_model_config,  # 传递模型配置
-                deep_model_config=deep_model_config     # 传递模型配置
+                deep_model_config=deep_model_config,    # 传递模型配置
+                expression_profile=getattr(task.parameters, "expression_profile", "balanced"),
             )
             
             if progress_callback:
@@ -708,7 +760,14 @@ class AnalysisService:
             analysis_date = task.parameters.analysis_date or datetime.now().strftime("%Y-%m-%d")
             
             # 调用现有的分析方法
-            _, decision = trading_graph.propagate(task.symbol, analysis_date)
+            with token_usage_context(session_id=task.task_id, analysis_type="stock_analysis"):
+                _, decision = trading_graph.propagate(task.symbol, analysis_date)
+
+            token_summary = self._get_token_usage_summary_sync(task.task_id)
+            total_tokens_used = token_summary.get("total_tokens", 0)
+            if isinstance(decision, dict):
+                decision["tokens_used"] = total_tokens_used
+                decision["token_usage"] = token_summary
             
             execution_time = (datetime.utcnow() - start_time).total_seconds()
             
@@ -728,7 +787,7 @@ class AnalysisService:
                 key_points=decision.get("key_points", []),
                 detailed_analysis=decision,
                 execution_time=execution_time,
-                tokens_used=decision.get("tokens_used", 0),
+                tokens_used=total_tokens_used,
                 model_info=model_info  # 🔥 添加模型信息字段
             )
 

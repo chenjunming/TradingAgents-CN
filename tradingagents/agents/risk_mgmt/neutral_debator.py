@@ -4,21 +4,17 @@ import json
 # 导入统一日志系统
 from tradingagents.utils.logging_init import get_logger
 logger = get_logger("default")
-
-_MAX_HISTORY_CHARS = 2400
-_MAX_LAST_RESPONSE_CHARS = 1200
-_MAX_REPORT_CHARS = 1800
-
-
-def _tail_text(text: str, max_chars: int) -> str:
-    if not text or len(text) <= max_chars:
-        return text
-    return f"...[已截断较早内容，仅保留最近{max_chars}字符]\n{text[-max_chars:]}"
+from tradingagents.agents.utils.prompt_contract import (
+    get_anti_repetition_rules,
+    get_concise_contract,
+    get_output_schema,
+)
 
 
 def create_neutral_debator(llm):
     def neutral_node(state) -> dict:
         risk_debate_state = state["risk_debate_state"]
+        expression_profile = state.get("expression_profile", "balanced")
         history = risk_debate_state.get("history", "")
         neutral_history = risk_debate_state.get("neutral_history", "")
 
@@ -31,14 +27,14 @@ def create_neutral_debator(llm):
         fundamentals_report = state["fundamentals_report"]
 
         trader_decision = state["trader_investment_plan"]
-        history_for_prompt = _tail_text(history, _MAX_HISTORY_CHARS)
-        current_risky_for_prompt = _tail_text(current_risky_response, _MAX_LAST_RESPONSE_CHARS)
-        current_safe_for_prompt = _tail_text(current_safe_response, _MAX_LAST_RESPONSE_CHARS)
-        market_for_prompt = _tail_text(market_research_report, _MAX_REPORT_CHARS)
-        sentiment_for_prompt = _tail_text(sentiment_report, _MAX_REPORT_CHARS)
-        news_for_prompt = _tail_text(news_report, _MAX_REPORT_CHARS)
-        fundamentals_for_prompt = _tail_text(fundamentals_report, _MAX_REPORT_CHARS)
-        trader_for_prompt = _tail_text(trader_decision, _MAX_REPORT_CHARS)
+        history_for_prompt = history
+        current_risky_for_prompt = current_risky_response
+        current_safe_for_prompt = current_safe_response
+        market_for_prompt = market_research_report
+        sentiment_for_prompt = sentiment_report
+        news_for_prompt = news_report
+        fundamentals_for_prompt = fundamentals_report
+        trader_for_prompt = trader_decision
 
         # 📊 记录所有输入数据的长度，用于性能分析
         logger.info(f"📊 [Neutral Analyst] 输入数据长度统计:")
@@ -58,19 +54,32 @@ def create_neutral_debator(llm):
                               len(current_risky_for_prompt) + len(current_safe_for_prompt))
         logger.info(f"  - 🚨 总Prompt长度: {total_prompt_length:,} 字符 (~{total_prompt_length//4:,} tokens)")
 
-        prompt = f"""作为中性风险分析师，您的角色是提供平衡的视角，权衡交易员决策或计划的潜在收益和风险。您优先考虑全面的方法，评估上行和下行风险，同时考虑更广泛的市场趋势、潜在的经济变化和多元化策略。以下是交易员的决策：
+        concise_contract = get_concise_contract("neutral_debator", expression_profile)
+        output_schema = get_output_schema("neutral_debator")
+        anti_repetition_rules = get_anti_repetition_rules()
+
+        prompt = f"""你是中性风险辩手，目标是在收益与风险之间给出平衡方案。
+
+{concise_contract}
+角色输出模板：{output_schema}
+{anti_repetition_rules}
+
+你的任务：同时质疑激进与保守立场的偏差，提出可执行的中间路径。
+以下是交易员方案：
 
 {trader_for_prompt}
 
-您的任务是挑战激进和安全分析师，指出每种观点可能过于乐观或过于谨慎的地方。使用以下数据来源的见解来支持调整交易员决策的温和、可持续策略：
+请基于以下输入构建你的辩论：
 
 市场研究报告：{market_for_prompt}
 社交媒体情绪报告：{sentiment_for_prompt}
 最新世界事务报告：{news_for_prompt}
 公司基本面报告：{fundamentals_for_prompt}
-以下是当前对话历史：{history_for_prompt} 以下是激进分析师的最后回应：{current_risky_for_prompt} 以下是安全分析师的最后回应：{current_safe_for_prompt}。如果其他观点没有回应，请不要虚构，只需提出您的观点。
+对话历史：{history_for_prompt}
+激进辩手最新观点：{current_risky_for_prompt}
+保守辩手最新观点：{current_safe_for_prompt}
 
-通过批判性地分析双方来积极参与，解决激进和保守论点中的弱点，倡导更平衡的方法。挑战他们的每个观点，说明为什么适度风险策略可能提供两全其美的效果，既提供增长潜力又防范极端波动。专注于辩论而不是简单地呈现数据，旨在表明平衡的观点可以带来最可靠的结果。请用中文以对话方式输出，就像您在说话一样，不使用任何特殊格式。请将回答控制在600字以内。"""
+请用中文输出，明确平衡策略的触发条件和风险边界。"""
 
         logger.info(f"⏱️ [Neutral Analyst] 开始调用LLM...")
         llm_start_time = time.time()

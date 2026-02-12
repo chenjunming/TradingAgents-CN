@@ -52,11 +52,16 @@ def bridge_config_to_env():
         logger.info(f"  ✓ 桥接 MONGODB_DATABASE_NAME: {mongodb_db_name}")
         bridged_count += 1
 
+        use_mongodb_storage_enabled = use_mongodb_storage.lower() == "true"
+
         # 1. 桥接大模型配置（基础 API 密钥）
         # 🔧 [优先级] .env 文件 > 数据库厂家配置
         # 🔥 修改：从数据库的 llm_providers 集合读取厂家配置，而不是从 JSON 文件
         # 只有当环境变量不存在或为占位符时，才使用数据库中的配置
         try:
+            if not use_mongodb_storage_enabled:
+                raise RuntimeError("USE_MONGODB_STORAGE=false")
+
             # 使用同步 MongoDB 客户端读取厂家配置
             from pymongo import MongoClient
             from app.core.config import settings
@@ -97,8 +102,11 @@ def bridge_config_to_env():
             client.close()
 
         except Exception as e:
-            logger.error(f"❌ 从数据库读取厂家配置失败: {e}", exc_info=True)
-            logger.warning("⚠️  将尝试从 JSON 文件读取配置作为后备方案")
+            if use_mongodb_storage_enabled:
+                logger.error(f"❌ 从数据库读取厂家配置失败: {e}", exc_info=True)
+                logger.warning("⚠️  将尝试从 JSON 文件读取配置作为后备方案")
+            else:
+                logger.info("ℹ️ USE_MONGODB_STORAGE=false，跳过从数据库读取厂家配置")
 
             # 后备方案：从 JSON 文件读取
             llm_configs = unified_config.get_llm_configs()
@@ -145,6 +153,9 @@ def bridge_config_to_env():
         # 🔧 [优先级] .env 文件 > 数据库配置
         # 🔥 修改：从数据库的 system_configs 集合读取数据源配置，而不是从 JSON 文件
         try:
+            if not use_mongodb_storage_enabled:
+                raise RuntimeError("USE_MONGODB_STORAGE=false")
+
             # 使用同步 MongoDB 客户端读取系统配置
             from pymongo import MongoClient
             from app.core.config import settings
@@ -173,8 +184,11 @@ def bridge_config_to_env():
             client.close()
 
         except Exception as e:
-            logger.error(f"❌ 从数据库读取数据源配置失败: {e}", exc_info=True)
-            logger.warning("⚠️  将尝试从 JSON 文件读取配置作为后备方案")
+            if use_mongodb_storage_enabled:
+                logger.error(f"❌ 从数据库读取数据源配置失败: {e}", exc_info=True)
+                logger.warning("⚠️  将尝试从 JSON 文件读取配置作为后备方案")
+            else:
+                logger.info("ℹ️ USE_MONGODB_STORAGE=false，跳过从数据库读取数据源配置")
             data_source_configs = unified_config.get_data_source_configs()
 
         for ds_config in data_source_configs:
