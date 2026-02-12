@@ -727,9 +727,9 @@ async def sync_longport_positions(
 
     # 拉取长桥持仓与余额
     try:
-        with TradeContext(Config.from_env()) as ctx:
-            stock_resp = await asyncio.to_thread(ctx.stock_positions, payload.symbols)
-            balances = await asyncio.to_thread(ctx.account_balance)
+        ctx = TradeContext(Config.from_env())
+        stock_resp = await asyncio.to_thread(ctx.stock_positions, payload.symbols)
+        balances = await asyncio.to_thread(ctx.account_balance)
     except Exception as e:
         logger.error(f"❌ Longport 持仓同步失败: {e}")
         raise HTTPException(status_code=502, detail=f"Longport 接口调用失败: {str(e)}")
@@ -739,6 +739,7 @@ async def sync_longport_positions(
     skip_count = 0
     synced_keys = set()
     synced_positions: List[Dict[str, Any]] = []
+    aggregated: Dict[str, Dict[str, Any]] = {}
 
     for ch in channels:
         channel_name = str(getattr(ch, "account_channel", "") or "")
@@ -755,42 +756,91 @@ async def sync_longport_positions(
                 skip_count += 1
                 continue
 
-            # 现有系统使用 int 持仓数量，若出现碎股则保留 raw_quantity
             raw_qty = float(getattr(p, "quantity", 0) or 0)
             raw_available = float(getattr(p, "available_quantity", 0) or 0)
-            qty = int(raw_qty)
-            available_qty = int(raw_available)
-
+            qty = raw_qty
+            available_qty = raw_available
             if qty <= 0:
                 skip_count += 1
                 continue
 
-            doc = {
-                "user_id": user_id,
-                "code": code,
-                "market": market,
-                "currency": str(getattr(p, "currency", "") or ("CNY" if market == "CN" else "HKD" if market == "HK" else "USD")),
-                "quantity": qty,
-                "available_qty": max(0, min(available_qty, qty)),
-                "frozen_qty": max(0, qty - available_qty),
-                "avg_cost": float(getattr(p, "cost_price", 0) or 0),
-                "symbol_name": str(getattr(p, "symbol_name", "") or ""),
-                "source": "longport",
-                "source_channel": channel_name,
-                "external_symbol": symbol,
-                "raw_quantity": raw_qty,
-                "raw_available_quantity": raw_available,
-                "updated_at": now_iso,
-            }
+            key = f"{market}:{code}"
+            cost_price = float(getattr(p, "cost_price", 0) or 0)
+            currency = str(getattr(p, "currency", "") or ("CNY" if market == "CN" else "HKD" if market == "HK" else "USD"))
+            symbol_name = str(getattr(p, "symbol_name", "") or "")
+            row = aggregated.get(key)
+            if row is None:
+                aggregated[key] = {
+                    "user_id": user_id,
+                    "code": code,
+                    "market": market,
+                    "currency": currency,
+                    "quantity": qty,
+                    "available_qty": max(0.0, available_qty),
+                    "avg_cost_amount": (cost_price * qty) if cost_price > 0 else 0.0,
+                    "avg_cost_qty": qty if cost_price > 0 else 0.0,
+                    "symbol_name": symbol_name,
+                    "source": "longport",
+                    "source_channels": {channel_name} if channel_name else set(),
+                    "external_symbol": symbol,
+                    "raw_quantity": qty,
+                    "raw_available_quantity": max(0.0, available_qty),
+                    "updated_at": now_iso,
+                }
+            else:
+                row["quantity"] += qty
+                row["available_qty"] += max(0.0, available_qty)
+                if cost_price > 0:
+                    row["avg_cost_amount"] += cost_price * qty
+                    row["avg_cost_qty"] += qty
+                row["raw_quantity"] += qty
+                row["raw_available_quantity"] += max(0.0, available_qty)
+                if channel_name:
+                    row["source_channels"].add(channel_name)
+                if not row.get("symbol_name") and symbol_name:
+                    row["symbol_name"] = symbol_name
 
-            await db["paper_positions"].update_one(
-                {"user_id": user_id, "code": code, "market": market},
-                {"$set": doc},
-                upsert=True,
-            )
-            synced_keys.add(f"{market}:{code}")
-            synced_positions.append({"code": code, "market": market, "quantity": qty, "external_symbol": symbol})
-            upsert_count += 1
+    for key, item in aggregated.items():
+        qty = float(item.get("quantity") or 0.0)
+        available_qty = float(item.get("available_qty") or 0.0)
+        available_qty = max(0.0, min(available_qty, qty))
+        avg_cost_qty = float(item.get("avg_cost_qty") or 0.0)
+        avg_cost_amount = float(item.get("avg_cost_amount") or 0.0)
+        avg_cost = (avg_cost_amount / avg_cost_qty) if avg_cost_qty > 0 else 0.0
+
+        doc = {
+            "user_id": user_id,
+            "code": item["code"],
+            "market": item["market"],
+            "currency": item["currency"],
+            "quantity": qty,
+            "available_qty": available_qty,
+            "frozen_qty": max(0.0, qty - available_qty),
+            "avg_cost": avg_cost,
+            "symbol_name": item.get("symbol_name") or "",
+            "source": "longport",
+            "source_channel": ",".join(sorted(item.get("source_channels") or [])),
+            "external_symbol": item.get("external_symbol") or "",
+            "raw_quantity": float(item.get("raw_quantity") or 0.0),
+            "raw_available_quantity": float(item.get("raw_available_quantity") or 0.0),
+            "updated_at": now_iso,
+        }
+
+        await db["paper_positions"].update_one(
+            {"user_id": user_id, "code": item["code"], "market": item["market"]},
+            {"$set": doc},
+            upsert=True,
+        )
+        synced_keys.add(key)
+        synced_positions.append(
+            {
+                "code": item["code"],
+                "market": item["market"],
+                "quantity": qty,
+                "external_symbol": item.get("external_symbol") or "",
+            }
+        )
+        upsert_count += 1
 
     # 替换旧 longport 持仓（不影响手工/其他来源持仓）
     removed_count = 0

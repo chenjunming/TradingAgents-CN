@@ -15,6 +15,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from app.core.config import settings
 from app.core.database import get_mongo_db, get_mongo_db_sync
 from app.core.response import ok
+from app.models.advisor_models import UnifiedPosition
 from app.models.analysis import AnalysisParameters, SingleAnalysisRequest
 from app.models.screening import OperatorType, ScreeningCondition
 from app.services.basics_sync import fetch_latest_roe_map
@@ -29,6 +30,7 @@ from app.services.favorites_service import favorites_service
 from app.services.foreign_stock_service import ForeignStockService
 from app.services.portfolio_service import portfolio_service
 from app.services.simple_analysis_service import get_simple_analysis_service
+from app.routers.paper import LongportSyncRequest, sync_longport_positions as sync_paper_longport_positions
 from app.utils.timezone import to_config_tz
 
 router = APIRouter(prefix="/api/feishu", tags=["feishu"])
@@ -108,9 +110,14 @@ def _help_text() -> str:
         "/daily - 今日投研摘要\n"
         "/pick - 候选股票建议\n"
         "/rebalance - 调仓建议\n"
-        "/position - 当前持仓\n"
+        "/position (/pos) - 当前持仓\n"
+        "/reportpos [数量] [A股,港股,美股] [快速|基础|标准|深度|全面] [force] - 基于当前持仓批量发起个股分析\n"
+        "/syncpos [symbols] - 同步长桥持仓到纸上账户（可选指定标的，逗号分隔）\n"
+        "/feedback [YYYY-MM] - 查看持续评估统计（胜率/回撤/归因）\n"
+        "/history [股票代码|股票名称|analysis_id] [数量] - 查看历史报告列表\n"
         "/report <代码|名称> [快速|基础|标准|深度|全面] [force] - 发起个股分析（默认全面；同股当天默认复用）\n"
         "/report <analysis_id> [模块] - 加载报告上下文并查看指定模块（也可点卡片按钮）\n"
+        "/reportid <analysis_id> [模块] - 强制按报告ID加载历史报告\n"
         "/screen [价值|质量|动量] [数量] [A股,港股,美股] - 触发选股并返回TopN\n"
         "\n"
         "二、A股持仓维护\n"
@@ -129,6 +136,528 @@ def _help_text() -> str:
         "/cancel <编号> - 取消执行\n"
         "（默认10分钟有效）"
     )
+
+
+def _parse_feedback_month_key(raw: Optional[str]) -> Optional[str]:
+    token = str(raw or "").strip()
+    if not token:
+        return None
+    m = re.fullmatch(r"(\d{4})[-/](\d{1,2})", token)
+    if not m:
+        return None
+    year = int(m.group(1))
+    month = int(m.group(2))
+    if year < 2000 or year > 2100 or month < 1 or month > 12:
+        return None
+    return f"{year:04d}-{month:02d}"
+
+
+def _fmt_feedback_group_top(group_dict: Dict[str, Any], top_n: int = 3) -> str:
+    if not isinstance(group_dict, dict) or not group_dict:
+        return "暂无"
+    ranked = sorted(
+        [
+            (
+                str(k),
+                float((v or {}).get("avg_return_pct", 0.0)),
+                int((v or {}).get("count", 0)),
+                float((v or {}).get("win_rate_pct", 0.0)),
+            )
+            for k, v in group_dict.items()
+        ],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    lines = []
+    for name, avg_ret, count, win_rate in ranked[:top_n]:
+        lines.append(f"{name}: 均值{avg_ret:.2f}% 胜率{win_rate:.1f}% 样本{count}")
+    return "；".join(lines) if lines else "暂无"
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _fmt_num(v: Optional[float], digits: int = 2) -> str:
+    if v is None:
+        return "-"
+    return f"{float(v):.{digits}f}"
+
+
+def _fmt_qty(v: Optional[float]) -> str:
+    if v is None:
+        return "-"
+    fv = float(v)
+    if abs(fv - round(fv)) < 1e-8:
+        return str(int(round(fv)))
+    return f"{fv:.4f}"
+
+
+def _fmt_pct(v: Optional[float]) -> str:
+    if v is None:
+        return "-"
+    return f"{float(v):+,.2f}%"
+
+
+def _fmt_money(v: Optional[float], currency: str) -> str:
+    if v is None:
+        return "-"
+    symbol = {"CNY": "¥", "HKD": "HK$", "USD": "$"}.get(str(currency or "").upper(), "")
+    return f"{symbol}{float(v):,.2f}" if symbol else f"{float(v):,.2f} {currency}"
+
+
+def _infer_currency(market: str, raw_currency: Optional[str]) -> str:
+    cur = str(raw_currency or "").upper().strip()
+    if cur:
+        return cur
+    if market == "HK":
+        return "HKD"
+    if market == "US":
+        return "USD"
+    return "CNY"
+
+
+async def _load_position_quote_map(positions: List[UnifiedPosition]) -> Dict[str, Dict[str, Optional[float]]]:
+    db = get_mongo_db()
+    quote_map: Dict[str, Dict[str, Optional[float]]] = {}
+
+    def _parse_pct_like(v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            has_percent = "%" in s
+            s = s.replace("%", "")
+            try:
+                num = float(s)
+            except Exception:
+                return None
+            if has_percent:
+                return num
+            return num
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    cn_codes = sorted({str(p.symbol or "").zfill(6) for p in positions if p.market == "CN" and str(p.symbol or "").strip()})
+    if cn_codes:
+        cursor = db["market_quotes"].find(
+            {"code": {"$in": cn_codes}},
+            {"_id": 0, "code": 1, "close": 1, "pct_chg": 1, "pre_close": 1},
+        )
+        rows = await cursor.to_list(length=None)
+        for row in rows:
+            code = str(row.get("code") or "").zfill(6)
+            if not code:
+                continue
+            price = _safe_float(row.get("close"))
+            pre_close = _safe_float(row.get("pre_close"))
+            pct = _safe_float(row.get("pct_chg"))
+            if price is not None and pre_close not in (None, 0, 0.0):
+                try:
+                    pct = (price / pre_close - 1.0) * 100.0
+                except Exception:
+                    pass
+            quote_map[f"CN:{code}"] = {
+                "price": price,
+                "pre_close": pre_close,
+                "pct_chg": pct,
+            }
+
+    foreign_service = ForeignStockService(db=db)
+    seen_foreign: set[str] = set()
+
+    async def _fetch_foreign(market: str, symbol: str) -> None:
+        key = f"{market}:{symbol}"
+        if key in seen_foreign:
+            return
+        seen_foreign.add(key)
+        try:
+            quote = await foreign_service.get_quote(market, symbol, force_refresh=False)
+        except Exception:
+            return
+        price = _safe_float(quote.get("price"))
+        if price is None:
+            price = _safe_float(quote.get("current_price"))
+        if price is None:
+            price = _safe_float(quote.get("close"))
+        pre_close = (
+            _safe_float(quote.get("pre_close"))
+            or _safe_float(quote.get("prev_close"))
+            or _safe_float(quote.get("previous_close"))
+            or _safe_float(quote.get("pc"))
+        )
+        # 兼容历史缓存：若缺失昨收，强制刷新一次拿新口径字段
+        if pre_close in (None, 0, 0.0):
+            try:
+                fresh = await foreign_service.get_quote(market, symbol, force_refresh=True)
+                if isinstance(fresh, dict) and fresh:
+                    quote = fresh
+                    price = _safe_float(quote.get("price")) or _safe_float(quote.get("current_price")) or _safe_float(quote.get("close"))
+                    pre_close = (
+                        _safe_float(quote.get("pre_close"))
+                        or _safe_float(quote.get("prev_close"))
+                        or _safe_float(quote.get("previous_close"))
+                        or _safe_float(quote.get("pc"))
+                    )
+            except Exception:
+                pass
+        pct = _parse_pct_like(quote.get("pct_chg"))
+        if pct is None:
+            pct = _parse_pct_like(quote.get("change_percent"))
+        if price is not None and pre_close not in (None, 0, 0.0):
+            try:
+                pct = (float(price) / float(pre_close) - 1.0) * 100.0
+            except Exception:
+                pass
+        quote_map[key] = {"price": price, "pre_close": pre_close, "pct_chg": pct}
+
+    tasks = []
+    for p in positions:
+        market = str(p.market or "").upper().strip()
+        if market not in {"HK", "US"}:
+            continue
+        symbol = str(p.symbol or "").upper().strip()
+        if not symbol:
+            continue
+        tasks.append(_fetch_foreign(market, symbol))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    return quote_map
+
+
+async def _collect_positions_snapshot(user_id: str) -> Dict[str, Any]:
+    positions = await portfolio_service.get_unified_positions(user_id)
+    order = ["CN", "HK", "US"]
+    market_name = {"CN": "A股", "HK": "港股", "US": "美股"}
+    result: Dict[str, Any] = {
+        "total_count": 0,
+        "order": order,
+        "market_name": market_name,
+        "groups": {mk: {"rows": [], "count": 0, "currency": _infer_currency(mk, None), "market_value_sum": 0.0, "pnl_sum": 0.0, "day_pnl_sum": 0.0} for mk in order},
+    }
+    if not positions:
+        return result
+
+    quote_map = await _load_position_quote_map(positions)
+    allowed_markets = set(order)
+
+    enriched: List[Dict[str, Any]] = []
+    for p in positions:
+        market = str(p.market or "").upper().strip()
+        symbol = str(p.symbol or "").upper().strip()
+        if not symbol or market not in allowed_markets:
+            continue
+
+        code = symbol.zfill(6) if market == "CN" else symbol
+        key = f"{market}:{code}"
+        q = quote_map.get(key) or quote_map.get(f"{market}:{symbol}") or {}
+
+        qty = _safe_float(p.quantity) or 0.0
+        avg_cost = _safe_float(p.avg_cost)
+        current_price = _safe_float(p.current_price)
+        if current_price is None:
+            current_price = _safe_float(q.get("price"))
+        day_pct = _safe_float(q.get("pct_chg"))
+        q_pre_close = _safe_float(q.get("pre_close"))
+        if current_price is not None and q_pre_close not in (None, 0, 0.0):
+            try:
+                day_pct = (float(current_price) / float(q_pre_close) - 1.0) * 100.0
+            except Exception:
+                pass
+        day_pnl = None
+        if current_price is not None and q_pre_close not in (None, 0, 0.0):
+            try:
+                day_pnl = (float(current_price) - float(q_pre_close)) * qty
+            except Exception:
+                day_pnl = None
+
+        market_value = _safe_float(p.market_value)
+        if market_value is None and current_price is not None:
+            market_value = current_price * qty
+
+        pnl = _safe_float(p.pnl)
+        cost_total = avg_cost * qty if avg_cost is not None else None
+        if pnl is None and market_value is not None and cost_total is not None:
+            pnl = market_value - cost_total
+
+        pnl_pct = _safe_float(p.pnl_pct)
+        if pnl_pct is None and pnl is not None and cost_total not in (None, 0.0):
+            pnl_pct = (pnl / cost_total) * 100.0
+
+        currency = _infer_currency(market, p.currency)
+        enriched.append(
+            {
+                "market": market,
+                "market_name": market_name.get(market, market),
+                "symbol": code,
+                "name": str(p.name or "").strip(),
+                "quantity": qty,
+                "avg_cost": avg_cost,
+                "current_price": current_price,
+                "day_pct": day_pct,
+                "pre_close": q_pre_close,
+                "day_pnl": day_pnl,
+                "market_value": market_value,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "currency": currency,
+            }
+        )
+
+    market_total_mv: Dict[str, float] = {}
+    for item in enriched:
+        mv = item.get("market_value")
+        if mv is None:
+            continue
+        market_total_mv[item["market"]] = market_total_mv.get(item["market"], 0.0) + float(mv)
+
+    for mk in order:
+        rows = [x for x in enriched if x["market"] == mk]
+
+        rows.sort(key=lambda x: (x.get("market_value") is None, -(x.get("market_value") or 0.0), x.get("symbol") or ""))
+        mv_sum = sum((x.get("market_value") or 0.0) for x in rows if x.get("market_value") is not None)
+        pnl_sum = sum((x.get("pnl") or 0.0) for x in rows if x.get("pnl") is not None)
+        day_pnl_sum = sum((x.get("day_pnl") or 0.0) for x in rows if x.get("day_pnl") is not None)
+
+        cur = rows[0]["currency"] if rows else _infer_currency(mk, None)
+        for x in rows:
+            weight = None
+            mv = x.get("market_value")
+            if mv is not None and market_total_mv.get(mk, 0.0) > 0:
+                weight = float(mv) / market_total_mv[mk] * 100.0
+            x["weight_pct"] = weight
+
+        result["groups"][mk] = {
+            "rows": rows,
+            "count": len(rows),
+            "currency": cur,
+            "market_value_sum": mv_sum,
+            "pnl_sum": pnl_sum,
+            "day_pnl_sum": day_pnl_sum,
+        }
+
+    result["total_count"] = len(enriched)
+    return result
+
+
+def _build_positions_snapshot_card(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    order = snapshot.get("order") or ["CN", "HK", "US"]
+    market_name = snapshot.get("market_name") or {"CN": "A股", "HK": "港股", "US": "美股"}
+    groups = snapshot.get("groups") or {}
+    total_count = int(snapshot.get("total_count") or 0)
+
+    def _md_cell(text: str) -> str:
+        return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+    md_lines: List[str] = [f"当前持仓明细（共 {total_count} 只）", ""]
+
+    for mk in order:
+        sec = groups.get(mk) or {}
+        rows = sec.get("rows") or []
+        title = market_name.get(mk, mk)
+        if not rows:
+            md_lines.append(f"### {title}")
+            md_lines.append("暂无持仓")
+            md_lines.append("")
+            continue
+
+        currency = str(sec.get("currency") or _infer_currency(mk, None))
+        mv_sum = _fmt_money(_safe_float(sec.get("market_value_sum")), currency)
+        pnl_sum = _fmt_money(_safe_float(sec.get("pnl_sum")), currency)
+        day_pnl_sum = _fmt_money(_safe_float(sec.get("day_pnl_sum")), currency)
+
+        md_lines.append(f"### {title}（{len(rows)}）")
+        md_lines.append(f"市值: {mv_sum} | 浮盈亏: {pnl_sum} | 当日盈亏: {day_pnl_sum}")
+        md_lines.append("")
+        md_lines.append("| 标的 | 成本/现价 | 股数 | 仓位 | 盈亏(总%)/日涨跌/日额 |")
+        md_lines.append("| --- | --- | ---: | ---: | --- |")
+
+        for x in rows:
+            symbol = str(x.get("symbol") or "-")
+            name = str(x.get("name") or "").strip()
+            display = f"{name} ({symbol})" if name else symbol
+            cost_price = f"{_fmt_num(_safe_float(x.get('avg_cost')), 4)} / {_fmt_num(_safe_float(x.get('current_price')), 4)}"
+            qty = _fmt_qty(_safe_float(x.get("quantity")))
+            weight = _fmt_pct(_safe_float(x.get("weight_pct")))
+            pnl_text = (
+                f"{_fmt_money(_safe_float(x.get('pnl')), str(x.get('currency') or currency))} "
+                f"({_fmt_pct(_safe_float(x.get('pnl_pct')))})"
+            )
+            day_text = _fmt_pct(_safe_float(x.get("day_pct")))
+            day_pnl_text = _fmt_money(_safe_float(x.get("day_pnl")), str(x.get("currency") or currency))
+            md_lines.append(
+                f"| {_md_cell(display)} | {_md_cell(cost_price)} | {_md_cell(qty)} | {_md_cell(weight)} | {_md_cell(f'{pnl_text} / {day_text} / {day_pnl_text}')} |"
+            )
+        md_lines.append("")
+
+    md_lines.append("注：仓位为市场内占比；浮盈亏基于成本价与最新价估算。")
+    markdown_content = "\n".join(md_lines).strip() or "暂无持仓"
+
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "持仓总览"}},
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": markdown_content,
+                    "text_align": "left",
+                    "text_size": "normal",
+                }
+            ]
+        },
+    }
+
+
+def _render_positions_snapshot_text(snapshot: Dict[str, Any]) -> str:
+    total_count = int(snapshot.get("total_count") or 0)
+    if total_count <= 0:
+        return "暂无持仓"
+
+    order = snapshot.get("order") or ["CN", "HK", "US"]
+    market_name = snapshot.get("market_name") or {"CN": "A股", "HK": "港股", "US": "美股"}
+    groups = snapshot.get("groups") or {}
+    lines: List[str] = [f"当前持仓明细（共{total_count}只）"]
+
+    for mk in order:
+        sec = groups.get(mk) or {}
+        rows = sec.get("rows") or []
+        title = market_name.get(mk, mk)
+        lines.append(f"【{title}】")
+        if not rows:
+            lines.append("暂无持仓")
+            lines.append("")
+            continue
+
+        currency = str(sec.get("currency") or _infer_currency(mk, None))
+        lines.append(
+            f"持仓数:{len(rows)} 市值:{_fmt_money(_safe_float(sec.get('market_value_sum')), currency)} "
+            f"浮盈亏:{_fmt_money(_safe_float(sec.get('pnl_sum')), currency)} "
+            f"当日盈亏:{_fmt_money(_safe_float(sec.get('day_pnl_sum')), currency)}"
+        )
+        for x in rows:
+            name_suffix = f" {x['name']}" if x.get("name") else ""
+            lines.append(
+                f"- {x['symbol']}{name_suffix} | 成本/现价:{_fmt_num(_safe_float(x.get('avg_cost')), 4)}/{_fmt_num(_safe_float(x.get('current_price')), 4)} | 股数:{_fmt_qty(_safe_float(x.get('quantity')))}"
+            )
+            lines.append(
+                f"  日涨跌:{_fmt_pct(_safe_float(x.get('day_pct')))} | 仓位:{_fmt_pct(_safe_float(x.get('weight_pct')))} | "
+                f"浮盈亏:{_fmt_money(_safe_float(x.get('pnl')), str(x.get('currency') or currency))} ({_fmt_pct(_safe_float(x.get('pnl_pct')))}) | "
+                f"当日盈亏:{_fmt_money(_safe_float(x.get('day_pnl')), str(x.get('currency') or currency))}"
+            )
+        lines.append("")
+
+    lines.append("注: 仓位为市场内占比；浮盈亏基于成本价与最新价估算。")
+    return "\n".join(lines)
+
+
+async def _build_positions_snapshot_text(user_id: str) -> str:
+    snapshot = await _collect_positions_snapshot(user_id)
+    return _render_positions_snapshot_text(snapshot)
+
+
+async def _send_positions_snapshot_card(
+    *,
+    user_id: str,
+    chat_id: Optional[str],
+    reply_to_message_id: Optional[str],
+) -> Tuple[str, bool]:
+    snapshot = await _collect_positions_snapshot(user_id)
+    total_count = int(snapshot.get("total_count") or 0)
+    text_fallback = _render_positions_snapshot_text(snapshot)
+    if not chat_id:
+        return text_fallback, False
+    if total_count <= 0:
+        await feishu_push_service.send_text(chat_id, "暂无持仓", reply_to_message_id=reply_to_message_id)
+        return "暂无持仓", True
+
+    card = _build_positions_snapshot_card(snapshot)
+    result = await feishu_push_service.send_custom_card(
+        chat_id,
+        card,
+        action="positions_snapshot_card",
+        reply_to_message_id=reply_to_message_id,
+    )
+    if result.get("success"):
+        return text_fallback, True
+    return text_fallback, False
+
+
+async def _feedback_summary_text(month_key: Optional[str] = None) -> str:
+    db = get_mongo_db()
+    metrics_doc = await db.analysis_feedback_portfolio_metrics.find_one(
+        {"scope": "global_latest"},
+        {"_id": 0},
+    )
+    if month_key:
+        monthly_doc = await db.analysis_feedback_monthly_reports.find_one(
+            {"month_key": month_key},
+            {"_id": 0},
+        )
+    else:
+        monthly_doc = await db.analysis_feedback_monthly_reports.find_one(
+            {},
+            {"_id": 0},
+            sort=[("month_key", -1)],
+        )
+
+    recent_closed = await db.analysis_feedback_jobs.find(
+        {"status": "closed"},
+        {
+            "_id": 0,
+            "stock_symbol": 1,
+            "decision.action_text": 1,
+            "last_strategy_return_pct": 1,
+            "exit_reason": 1,
+            "closed_at": 1,
+        },
+    ).sort("closed_at", -1).limit(5).to_list(length=5)
+
+    lines: List[str] = ["持续评估统计"]
+    if metrics_doc:
+        lines.append(
+            "组合概览: "
+            f"样本{int(metrics_doc.get('total_closed_positions', 0))} "
+            f"胜率{float(metrics_doc.get('win_rate_pct', 0.0)):.1f}% "
+            f"均值{float(metrics_doc.get('avg_return_pct', 0.0)):.2f}% "
+            f"PF={float(metrics_doc.get('profit_factor', 0.0) or 0.0):.2f} "
+            f"最大回撤{float(metrics_doc.get('max_drawdown_pct', 0.0)):.2f}%"
+        )
+    else:
+        lines.append("组合概览: 暂无已闭环样本")
+
+    if monthly_doc:
+        mk = str(monthly_doc.get("month_key") or "")
+        lines.append(f"{mk} 归因:")
+        lines.append(f"- 市场Top: {_fmt_feedback_group_top(monthly_doc.get('by_market') or {}, top_n=3)}")
+        lines.append(f"- 动作Top: {_fmt_feedback_group_top(monthly_doc.get('by_action') or {}, top_n=3)}")
+        lines.append(f"- 行业Top: {_fmt_feedback_group_top(monthly_doc.get('by_industry') or {}, top_n=3)}")
+    else:
+        lines.append("月度归因: 暂无数据")
+
+    if recent_closed:
+        lines.append("最近5笔闭环:")
+        for row in recent_closed:
+            symbol = str(row.get("stock_symbol") or "-")
+            action_text = str((row.get("decision") or {}).get("action_text") or "-")
+            ret = row.get("last_strategy_return_pct")
+            ret_text = "-" if ret is None else f"{float(ret):.2f}%"
+            exit_reason = str(row.get("exit_reason") or "-")
+            lines.append(f"- {symbol} {action_text} 收益{ret_text} 退出={exit_reason}")
+
+    lines.append("可用命令: /feedback 或 /feedback 2026-02")
+    return "\n".join(lines)
 
 
 def _extract_text(payload: Dict[str, Any]) -> str:
@@ -504,13 +1033,20 @@ def _day_start_local() -> datetime:
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def _parse_report_args(args: List[str], default_depth: str = "全面") -> Tuple[str, bool, Optional[str]]:
+def _parse_report_args(
+    args: List[str], default_depth: str = "全面"
+) -> Tuple[str, bool, Optional[str], Optional[str]]:
     depth = default_depth
     force_refresh = False
     section: Optional[str] = None
+    market_hint: Optional[str] = None
     for tok in args:
         raw = str(tok or "").strip()
         if not raw:
+            continue
+        normalized_market = _normalize_market_type_hint(raw)
+        if normalized_market:
+            market_hint = normalized_market
             continue
         if _is_force_refresh_token(raw):
             force_refresh = True
@@ -522,7 +1058,240 @@ def _parse_report_args(args: List[str], default_depth: str = "全面") -> Tuple[
         normalized_section = _normalize_report_section(raw)
         if normalized_section:
             section = normalized_section
-    return depth, force_refresh, section
+    return depth, force_refresh, section, market_hint
+
+
+def _parse_history_args(args: List[str], default_limit: int = 10) -> Tuple[Optional[str], int]:
+    limit = default_limit
+    keyword_parts: List[str] = []
+    for tok in args:
+        raw = str(tok or "").strip()
+        if not raw:
+            continue
+        if re.fullmatch(r"\d{1,2}", raw):
+            limit = max(1, min(30, int(raw)))
+            continue
+        keyword_parts.append(raw)
+    keyword = " ".join(keyword_parts).strip() if keyword_parts else None
+    return keyword, limit
+
+
+def _market_type_to_code(market_type: Optional[str]) -> Optional[str]:
+    m = str(market_type or "").strip()
+    if m == "A股":
+        return "CN"
+    if m == "港股":
+        return "HK"
+    if m == "美股":
+        return "US"
+    return None
+
+
+def _market_code_to_type(market_code: str) -> str:
+    mk = str(market_code or "").upper().strip()
+    if mk == "HK":
+        return "港股"
+    if mk == "US":
+        return "美股"
+    return "A股"
+
+
+def _normalize_symbol_for_market(symbol: str, market_code: str) -> str:
+    raw = str(symbol or "").strip().upper()
+    if market_code == "CN":
+        return raw.zfill(6)
+    if market_code == "HK":
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return f"{digits.zfill(5)}.HK" if digits else raw
+    # US
+    return raw.replace(".US", "")
+
+
+def _parse_reportpos_args(
+    args: List[str],
+    default_limit: int = 5,
+    default_depth: str = "全面",
+) -> Tuple[int, List[str], str, bool]:
+    limit = default_limit
+    depth = default_depth
+    force_refresh = False
+    market_codes: List[str] = []
+
+    for tok in args:
+        raw = str(tok or "").strip()
+        if not raw:
+            continue
+        if re.fullmatch(r"\d{1,2}", raw):
+            limit = max(1, min(20, int(raw)))
+            continue
+        normalized_depth = _normalize_research_depth(raw, default="")
+        if normalized_depth:
+            depth = normalized_depth
+            continue
+        if _is_force_refresh_token(raw):
+            force_refresh = True
+            continue
+
+        market_tokens = [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
+        for mtok in market_tokens:
+            mtype = _normalize_market_type_hint(mtok)
+            mcode = _market_type_to_code(mtype)
+            if mcode and mcode not in market_codes:
+                market_codes.append(mcode)
+
+    if not market_codes:
+        market_codes = ["CN", "HK", "US"]
+
+    return limit, market_codes, depth, force_refresh
+
+
+async def _start_batch_analysis_from_positions(
+    *,
+    user_id: str,
+    chat_id: Optional[str],
+    conversation_id: str,
+    limit: int,
+    market_codes: List[str],
+    research_depth: str,
+    force_refresh: bool,
+) -> Tuple[str, bool]:
+    positions = await portfolio_service.get_unified_positions(user_id)
+    selected = [p for p in positions if float(p.quantity or 0) > 0 and str(p.market or "").upper() in set(market_codes)]
+    if not selected:
+        markets_text = ",".join([_market_code_to_type(m) for m in market_codes])
+        return f"当前持仓中没有可分析标的（筛选市场: {markets_text}）。", False
+
+    def _position_score(p: UnifiedPosition) -> float:
+        mv = _safe_float(p.market_value)
+        if mv is not None:
+            return mv
+        cost = _safe_float(p.avg_cost)
+        qty = _safe_float(p.quantity) or 0.0
+        if cost is not None:
+            return cost * qty
+        return qty
+
+    selected.sort(key=_position_score, reverse=True)
+    selected = selected[: max(1, min(20, limit))]
+
+    started = 0
+    reused = 0
+    failed: List[str] = []
+    details: List[str] = []
+
+    for p in selected:
+        mk = str(p.market or "CN").upper().strip()
+        stock_symbol = _normalize_symbol_for_market(str(p.symbol or ""), mk)
+        stock_name = str(p.name or stock_symbol).strip() or stock_symbol
+        market_type = _market_code_to_type(mk)
+        try:
+            msg, _ = await _start_or_reuse_stock_analysis(
+                user_id=user_id,
+                chat_id=chat_id,
+                conversation_id=conversation_id,
+                symbol=stock_symbol,
+                stock_name=stock_name,
+                market_type=market_type,
+                research_depth=research_depth,
+                force_refresh=force_refresh,
+            )
+            if msg.startswith("已复用今日报告"):
+                reused += 1
+                details.append(f"- 复用: {stock_name} ({stock_symbol})")
+            else:
+                started += 1
+                details.append(f"- 启动: {stock_name} ({stock_symbol})")
+        except Exception as exc:
+            failed.append(f"{stock_name}({stock_symbol}): {exc}")
+
+    summary_lines = [
+        f"持仓批量分析已处理 {len(selected)} 只（深度: {research_depth}，force: {'是' if force_refresh else '否'}）",
+        f"启动: {started}，复用: {reused}，失败: {len(failed)}",
+    ]
+    summary_lines.extend(details[:20])
+    if failed:
+        summary_lines.append("失败明细:")
+        summary_lines.extend([f"- {x}" for x in failed[:10]])
+    summary_lines.append("提示: 可用 /report <analysis_id> 查看指定报告详情。")
+    return "\n".join(summary_lines), False
+
+
+def _trim_text(text: str, max_len: int = 70) -> str:
+    t = str(text or "").replace("\n", " ").strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 3].rstrip() + "..."
+
+
+async def _history_reports_text(report_keyword: Optional[str], limit: int = 10) -> str:
+    db = get_mongo_db()
+    lim = max(1, min(30, int(limit or 10)))
+    q = str(report_keyword or "").strip()
+
+    query: Dict[str, Any] = {}
+    if q:
+        or_conditions: List[Dict[str, Any]] = [{"analysis_id": q}, {"task_id": q}]
+        q_upper = q.upper()
+        if re.fullmatch(r"\d{6}", q):
+            or_conditions.append({"stock_symbol": q})
+        if re.fullmatch(r"[A-Z]{1,6}(?:\.HK)?", q_upper):
+            or_conditions.append({"stock_symbol": q_upper})
+        # 按名称模糊匹配
+        or_conditions.append({"stock_name": {"$regex": re.escape(q), "$options": "i"}})
+        # 尝试 A 股名称 -> 代码
+        try:
+            resolved_symbol, _ = await _resolve_a_share_symbol(q)
+            if resolved_symbol:
+                or_conditions.append({"stock_symbol": resolved_symbol})
+        except Exception:
+            pass
+        query = {"$or": or_conditions}
+
+    docs = await db.analysis_reports.find(
+        query,
+        {
+            "_id": 0,
+            "analysis_id": 1,
+            "task_id": 1,
+            "stock_symbol": 1,
+            "stock_name": 1,
+            "analysis_date": 1,
+            "created_at": 1,
+            "summary": 1,
+            "status": 1,
+            "decision.action": 1,
+        },
+    ).sort("created_at", -1).limit(lim).to_list(length=lim)
+
+    if not docs:
+        if q:
+            return f"未找到“{q}”的历史报告。可试试：/history {q} 20"
+        return "暂无历史报告。先执行 /report <股票> 生成分析。"
+
+    header = f"历史报告（关键词: {q}，最近{len(docs)}条）" if q else f"历史报告（最近{len(docs)}条）"
+    lines: List[str] = [header]
+    for idx, doc in enumerate(docs, 1):
+        report_id = str(doc.get("analysis_id") or doc.get("task_id") or "")
+        symbol = str(doc.get("stock_symbol") or "-")
+        stock_name = str(doc.get("stock_name") or "").strip()
+        stock_part = f"{symbol} {stock_name}".strip()
+        analysis_date = str(doc.get("analysis_date") or "")
+        if not analysis_date:
+            created_at = doc.get("created_at")
+            if hasattr(created_at, "strftime"):
+                analysis_date = created_at.strftime("%Y-%m-%d")
+            else:
+                analysis_date = "-"
+        action = str((doc.get("decision") or {}).get("action") or "").strip()
+        action_text = f" {action}" if action else ""
+        summary = _trim_text(str(doc.get("summary") or ""), max_len=60)
+        if summary:
+            lines.append(f"{idx}. {analysis_date} {stock_part}{action_text} id:{report_id}\n   摘要: {summary}")
+        else:
+            lines.append(f"{idx}. {analysis_date} {stock_part}{action_text} id:{report_id}")
+
+    lines.append("查看详情: /report <analysis_id>")
+    return "\n".join(lines)
 
 
 async def _resolve_a_share_symbol(keyword: str) -> tuple[str, str]:
@@ -788,9 +1557,60 @@ async def _execute_action(user_id: str, action: str, params: Dict[str, Any]) -> 
         lines = [f"{x.symbol} {x.action} {x.current_weight:.0%}->{x.target_weight:.0%}" for x in actions[:10]]
         return "\n".join(lines) if lines else "暂无调仓建议"
     if action == "positions_snapshot":
-        positions = await portfolio_service.get_unified_positions(user_id)
-        lines = [f"{x.market} {x.symbol} 持仓:{x.quantity}" for x in positions[:20]]
-        return "\n".join(lines) if lines else "暂无持仓"
+        return await _build_positions_snapshot_text(user_id)
+    if action == "sync_longport_positions":
+        def _parse_bool(value: Any, default: bool) -> bool:
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            raw = str(value).strip().lower()
+            if raw in {"1", "true", "yes", "on", "y", "是"}:
+                return True
+            if raw in {"0", "false", "no", "off", "n", "否"}:
+                return False
+            return default
+
+        symbols_raw = params.get("symbols")
+        symbols: Optional[List[str]] = None
+        if isinstance(symbols_raw, list):
+            symbols = [str(x).strip() for x in symbols_raw if str(x).strip()]
+        elif isinstance(symbols_raw, str) and symbols_raw.strip():
+            symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
+
+        payload = LongportSyncRequest(
+            symbols=symbols or None,
+            replace_existing_longport_positions=_parse_bool(
+                params.get("replace_existing_longport_positions"),
+                default=True,
+            ),
+            sync_cash=_parse_bool(params.get("sync_cash"), default=True),
+        )
+        result = await sync_paper_longport_positions(payload=payload, current_user={"id": user_id})
+        data = result.get("data", {}) if isinstance(result, dict) else {}
+        synced_count = int(data.get("synced_positions_count", 0) or 0)
+        removed_count = int(data.get("removed_positions_count", 0) or 0)
+        skipped_count = int(data.get("skipped_positions_count", 0) or 0)
+        cash_updates = data.get("synced_cash", {}) or {}
+        cash_text = json.dumps(cash_updates, ensure_ascii=False) if cash_updates else "{}"
+        return (
+            "长桥持仓同步完成\n"
+            f"同步: {synced_count}，移除: {removed_count}，跳过: {skipped_count}\n"
+            f"现金: {cash_text}"
+        )
+    if action == "feedback_metrics":
+        month_key = _parse_feedback_month_key(str(params.get("month_key") or ""))
+        return await _feedback_summary_text(month_key=month_key)
+    if action == "list_history_reports":
+        report_keyword = str(params.get("report_keyword") or "").strip() or None
+        limit_raw = params.get("limit")
+        try:
+            limit = int(float(str(limit_raw))) if limit_raw is not None else 10
+        except Exception:
+            limit = 10
+        return await _history_reports_text(report_keyword=report_keyword, limit=limit)
     if action == "run_stock_analysis":
         return "已识别个股分析意图，正在启动任务。"
     if action == "run_stock_screening":
@@ -2435,39 +3255,70 @@ async def _resolve_stock_for_analysis(
 
     market_type = _normalize_market_type_hint(market_hint) or str(market_hint or "").strip() or None
     q_clean = feishu_nl_agent_service._strip_market_suffix(q) or q
+    q_upper = str(q_clean).upper()
+
+    # 无显式市场时：对标准 ticker 做轻量自动推断，避免把美股代码错当 A 股名称
+    if not market_type:
+        if re.fullmatch(r"[A-Za-z]{1,5}", q_clean):
+            market_type = "美股"
+        elif re.fullmatch(r"\d{4,5}", q_clean):
+            market_type = "港股"
 
     # 兼容 hk00981 / usAAPL 直传代码
-    m_hk_pref = re.fullmatch(r"(?i)hk[\s\-_\.]*([0-9]{1,5})", q)
+    m_hk_pref = re.fullmatch(r"(?i)hk[\s\-_\.]*([0-9]{1,5})", q_clean)
     if m_hk_pref:
         digits = m_hk_pref.group(1).zfill(5)
         return f"{digits}.HK", f"{digits}.HK", market_type or "港股"
-    m_us_pref = re.fullmatch(r"(?i)us[\s\-_\.]*([A-Z][A-Z0-9.\-]{0,9})", q)
+    m_us_pref = re.fullmatch(r"(?i)us[\s\-_\.]*([A-Z][A-Z0-9.\-]{0,9})", q_clean)
     if m_us_pref:
         sym = m_us_pref.group(1).upper().replace(".US", "")
         return sym, sym, market_type or "美股"
 
-    if re.fullmatch(r"\d{6}", q):
-        symbol, name = await _resolve_a_share_symbol(q)
+    if re.fullmatch(r"\d{6}", q_clean):
+        symbol, name = await _resolve_a_share_symbol(q_clean)
         return symbol, name, market_type or "A股"
 
     # 港股代码（5位）支持补 .HK
-    if re.fullmatch(r"\d{1,5}", q) and (market_type == "港股" or len(q) == 5):
-        digits = q.zfill(5)
+    if re.fullmatch(r"\d{1,5}", q_clean) and (market_type == "港股" or len(q_clean) == 5):
+        digits = q_clean.zfill(5)
         return f"{digits}.HK", digits, market_type or "港股"
 
+    # 美股 ticker（1-5 位英文字母）直通：优先查本地名称，不命中也不阻断分析任务
+    if market_type == "美股" and re.fullmatch(r"[A-Za-z]{1,5}", q_clean):
+        symbol = q_upper
+        display_name = symbol
+        try:
+            db = get_mongo_db()
+            us_doc = await db.stock_basic_info_us.find_one(
+                {"$or": [{"symbol": symbol}, {"code": symbol}]},
+                {"_id": 0, "name": 1, "symbol": 1, "code": 1},
+                sort=[("updated_at", -1)],
+            )
+            if us_doc:
+                display_name = str(us_doc.get("name") or symbol).strip() or symbol
+        except Exception:
+            pass
+        return symbol, display_name, "美股"
+
     # 已带市场后缀
-    if re.fullmatch(r"[A-Za-z0-9]+\\.(HK|US|SH|SZ)", q, flags=re.IGNORECASE):
-        suffix = q.split(".")[-1].upper()
+    if re.fullmatch(r"[A-Za-z0-9]+\\.(HK|US|SH|SZ)", q_clean, flags=re.IGNORECASE):
+        suffix = q_clean.split(".")[-1].upper()
         inferred_market = "港股" if suffix == "HK" else ("美股" if suffix == "US" else "A股")
-        return q.upper(), q.upper(), market_type or inferred_market
+        return q_clean.upper(), q_clean.upper(), market_type or inferred_market
 
     # 按名称查询
     db = get_mongo_db()
+    if market_type == "港股":
+        basic_collection = db.stock_basic_info_hk
+    elif market_type == "美股":
+        basic_collection = db.stock_basic_info_us
+    else:
+        basic_collection = db.stock_basic_info
     query: Dict[str, Any] = {"name": {"$regex": re.escape(q_clean), "$options": "i"}}
-    if market_type in {"港股", "美股", "A股"}:
+    if market_type == "A股":
         query["$or"] = [{"market_type": market_type}, {"market": market_type}]
 
-    candidates = await db.stock_basic_info.find(
+    candidates = await basic_collection.find(
         query,
         {"_id": 0, "name": 1, "code": 1, "symbol": 1, "market_type": 1, "market": 1, "updated_at": 1},
     ).sort([("updated_at", -1)]).to_list(length=20)
@@ -2540,16 +3391,22 @@ async def _resolve_stock_for_analysis(
     if not doc:
         raise ValueError(f"未找到股票: {q_clean}")
 
-    name = str(doc.get("name") or q)
+    name = str(doc.get("name") or q_clean)
     symbol = str(doc.get("symbol") or doc.get("code") or "").strip()
     if not symbol:
-        raise ValueError(f"股票标识缺失: {q}")
+        raise ValueError(f"股票标识缺失: {q_clean}")
 
     # 归一化 A股代码
     if re.fullmatch(r"\d{6}", symbol):
         return symbol, name, market_type or "A股"
-    # 港股/美股保留原始 symbol
     mt = str(doc.get("market_type") or doc.get("market") or "").strip() or market_type or "A股"
+    if mt == "港股":
+        hk_digits = _normalize_hk_code(symbol)
+        if hk_digits:
+            return f"{hk_digits}.HK", name, "港股"
+    if mt == "美股":
+        us_symbol = re.sub(r"\.US$", "", symbol, flags=re.IGNORECASE).upper()
+        return us_symbol, name, "美股"
     return symbol, name, mt
 
 
@@ -2896,6 +3753,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
     user_id = _extract_user_id(payload)
     chat_id = _extract_chat_id(payload)
     msg_meta = _extract_message_meta(payload)
+    reply_to_message_id = str(msg_meta.get("message_id") or "").strip() or None
     reply_already_sent = False
     if not await _mark_inbound_message_once(msg_meta.get("message_id", "")):
         return ok({"ignored": True}, "duplicate message")
@@ -2906,7 +3764,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         if not args:
             reply = "用法: /confirm <编号> 或 /cancel <编号>"
             if chat_id:
-                await feishu_push_service.send_text(chat_id, reply)
+                await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
             return ok({"reply": reply})
 
         action_id = args[0].strip()
@@ -2914,7 +3772,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         if not pending:
             reply = f"未找到待确认操作或已过期: {action_id}"
             if chat_id:
-                await feishu_push_service.send_text(chat_id, reply)
+                await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
             return ok({"reply": reply})
 
         if command == "/cancel":
@@ -2927,7 +3785,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
                 push_turn={"role": "assistant", "content": reply, "ts": datetime.utcnow().isoformat()},
             )
             if chat_id:
-                await feishu_push_service.send_text(chat_id, reply)
+                await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
             return ok({"reply": reply})
 
         # /confirm
@@ -2938,7 +3796,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
             await _finalize_pending_action(action_id, "failed")
             reply = f"执行失败: {exc}"
         if chat_id:
-            await feishu_push_service.send_text(chat_id, reply)
+            await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
         await _upsert_conversation(
             conversation_id=conv_id,
             user_id=user_id,
@@ -2963,7 +3821,11 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         params = intent.get("params", {}) or {}
         instruction = str(intent.get("instruction") or "").strip()
         if chat_id and instruction:
-            await feishu_push_service.send_text(chat_id, f"AI决策指令: `{instruction}`")
+            await feishu_push_service.send_text(
+                chat_id,
+                f"AI决策指令: `{instruction}`",
+                reply_to_message_id=reply_to_message_id,
+            )
         try:
             if str(action) == "run_stock_analysis":
                 stock_keyword = str(params.get("stock_name_or_code") or params.get("stock") or text).strip()
@@ -2988,7 +3850,9 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
 
                 # 回执优先：避免等待后续网络/IO，先返回 webhook 响应。
                 if chat_id and not reply_already_sent:
-                    asyncio.create_task(feishu_push_service.send_text(chat_id, reply))
+                    asyncio.create_task(
+                        feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
+                    )
                 asyncio.create_task(
                     _upsert_conversation(
                         conversation_id=conv_id,
@@ -3005,8 +3869,11 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
                 "daily_picks",
                 "rebalance_suggestions",
                 "positions_snapshot",
+                "feedback_metrics",
+                "list_history_reports",
                 "list_watchlist",
                 "set_report_context",
+                "run_positions_batch_analysis",
                 "run_stock_screening",
             }:
                 if str(action) == "set_report_context":
@@ -3035,6 +3902,36 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
                         limit=limit,
                         markets=markets,
                     )
+                elif str(action) == "run_positions_batch_analysis":
+                    args_for_parse: List[str] = []
+                    if params.get("limit") is not None:
+                        args_for_parse.append(str(params.get("limit")))
+                    pm = params.get("markets")
+                    if isinstance(pm, list) and pm:
+                        args_for_parse.append(",".join([str(x) for x in pm if str(x).strip()]))
+                    elif isinstance(pm, str) and pm.strip():
+                        args_for_parse.append(pm)
+                    if params.get("research_depth"):
+                        args_for_parse.append(str(params.get("research_depth")))
+                    if bool(params.get("force_refresh")):
+                        args_for_parse.append("force")
+
+                    limit, market_codes, depth, force_refresh = _parse_reportpos_args(args_for_parse)
+                    reply, _ = await _start_batch_analysis_from_positions(
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        conversation_id=conv_id,
+                        limit=limit,
+                        market_codes=market_codes,
+                        research_depth=depth,
+                        force_refresh=force_refresh,
+                    )
+                elif str(action) == "positions_snapshot":
+                    reply, reply_already_sent = await _send_positions_snapshot_card(
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        reply_to_message_id=reply_to_message_id,
+                    )
                 else:
                     reply = await _execute_action(user_id, str(action), params)
             else:
@@ -3056,7 +3953,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
             reply = f"执行失败: {exc}"
 
         if chat_id and not reply_already_sent:
-            await feishu_push_service.send_text(chat_id, reply)
+            await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
         await _upsert_conversation(
             conversation_id=conv_id,
             user_id=user_id,
@@ -3072,18 +3969,15 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         prev_response_id = (
             str(((conv.get("llm_chat_state") or {}).get("previous_response_id") or "")).strip() or None
         ) if use_thread_context else None
-        llm_state_update: Dict[str, Any] = {}
-        if intent.get("reply"):
-            reply = intent.get("reply")
-        else:
-            reply, llm_state_update = feishu_nl_agent_service.chat_reply_with_state(
-                text=text,
-                context=conv.get("context"),
-                history=chat_history,
-                previous_response_id=prev_response_id,
-            )
+        llm_context = conv.get("context") if use_thread_context else None
+        reply, llm_state_update = feishu_nl_agent_service.chat_reply_with_state(
+            text=text,
+            context=llm_context,
+            history=chat_history,
+            previous_response_id=prev_response_id,
+        )
         if chat_id and not reply_already_sent:
-            await feishu_push_service.send_text(chat_id, reply)
+            await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
         await _upsert_conversation(
             conversation_id=conv_id,
             user_id=user_id,
@@ -3111,18 +4005,15 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         prev_response_id = (
             str(((conv.get("llm_chat_state") or {}).get("previous_response_id") or "")).strip() or None
         ) if use_thread_context else None
-        llm_state_update: Dict[str, Any] = {}
-        if intent.get("reply"):
-            reply = intent.get("reply")
-        else:
-            reply, llm_state_update = feishu_nl_agent_service.chat_reply_with_state(
-                text=text,
-                context=conv.get("context"),
-                history=chat_history,
-                previous_response_id=prev_response_id,
-            )
+        llm_context = conv.get("context") if use_thread_context else None
+        reply, llm_state_update = feishu_nl_agent_service.chat_reply_with_state(
+            text=text,
+            context=llm_context,
+            history=chat_history,
+            previous_response_id=prev_response_id,
+        )
         if chat_id and not reply_already_sent:
-            await feishu_push_service.send_text(chat_id, reply)
+            await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
         await _upsert_conversation(
             conversation_id=conv_id,
             user_id=user_id,
@@ -3139,7 +4030,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
     if command in {"/help", "help"}:
         reply = _help_text()
         if chat_id:
-            await feishu_push_service.send_text(chat_id, reply)
+            await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
         await _upsert_conversation(
             conversation_id=conv_id,
             user_id=user_id,
@@ -3148,10 +4039,10 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         )
         return ok({"reply": reply})
 
-    if command not in {"/daily", "/pick", "/rebalance", "/position", "/wl", "/report", "/screen"}:
-        reply = "支持命令: /help /daily /pick /rebalance /position /report /screen /wl /confirm /cancel"
+    if command not in {"/daily", "/pick", "/rebalance", "/position", "/pos", "/reportpos", "/syncpos", "/feedback", "/history", "/wl", "/report", "/reportid", "/screen"}:
+        reply = "支持命令: /help /daily /pick /rebalance /position(/pos) /reportpos /syncpos /feedback /history /report /reportid /screen /wl /confirm /cancel"
         if chat_id:
-            await feishu_push_service.send_text(chat_id, reply)
+            await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
         return ok({"reply": reply})
 
     if command == "/daily":
@@ -3165,38 +4056,93 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
         actions = await advisor_service.generate_rebalance(user_id)
         lines = [f"{x.symbol} {x.action} {x.current_weight:.0%}->{x.target_weight:.0%}" for x in actions[:10]]
         reply = "\n".join(lines) if lines else "暂无调仓建议"
-    elif command == "/position":
-        positions = await portfolio_service.get_unified_positions(user_id)
-        lines = [f"{x.market} {x.symbol} 持仓:{x.quantity}" for x in positions[:20]]
-        reply = "\n".join(lines) if lines else "暂无持仓"
+    elif command in {"/position", "/pos"}:
+        reply, reply_already_sent = await _send_positions_snapshot_card(
+            user_id=user_id,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+        )
+    elif command == "/reportpos":
+        limit, market_codes, depth, force_refresh = _parse_reportpos_args(args)
+        reply, _ = await _start_batch_analysis_from_positions(
+            user_id=user_id,
+            chat_id=chat_id,
+            conversation_id=conv_id,
+            limit=limit,
+            market_codes=market_codes,
+            research_depth=depth,
+            force_refresh=force_refresh,
+        )
+    elif command == "/syncpos":
+        symbols: Optional[List[str]] = None
+        if args:
+            merged = " ".join(args).strip()
+            if merged:
+                symbols = [s.strip() for s in merged.split(",") if s.strip()]
+        reply = await _execute_action(
+            user_id,
+            "sync_longport_positions",
+            {"symbols": symbols} if symbols else {},
+        )
+    elif command == "/feedback":
+        month_key = _parse_feedback_month_key(args[0] if args else None)
+        if args and month_key is None:
+            reply = "用法: /feedback 或 /feedback 2026-02"
+        else:
+            reply = await _feedback_summary_text(month_key=month_key)
+    elif command == "/history":
+        keyword, limit = _parse_history_args(args)
+        reply = await _history_reports_text(report_keyword=keyword, limit=limit)
+    elif command == "/reportid":
+        if not args:
+            reply = "用法: /reportid analysis_id [模块]"
+        else:
+            target = str(args[0] or "").strip()
+            requested_section = _normalize_report_section(args[1] if len(args) > 1 else None)
+            try:
+                ctx = await _resolve_report_context(target, section=requested_section)
+                await _upsert_conversation(
+                    conversation_id=conv_id,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    set_context=ctx,
+                )
+                if chat_id:
+                    await _send_report_selector_card_if_needed(chat_id, ctx)
+                    await _send_report_module_message(chat_id=chat_id, report_ctx=ctx)
+                    reply_already_sent = True
+                reply = f"已加载报告上下文: {ctx.get('stock_name') or ctx.get('stock_symbol')} ({ctx.get('report_id')})"
+            except Exception as exc:
+                reply = f"加载报告上下文失败: {exc}"
     elif command == "/report":
         if not args:
             reply = "用法: /report 股票代码|股票名称 [快速|基础|标准|深度|全面] [force] 或 /report analysis_id [模块]"
         else:
             target = str(args[0] or "").strip()
-            depth, force_refresh, requested_section = _parse_report_args(args[1:], default_depth="全面")
+            depth, force_refresh, requested_section, report_market_hint = _parse_report_args(
+                args[1:],
+                default_depth="全面",
+            )
 
-            # 明确使用报告ID时，保留“加载上下文”能力
-            if _looks_like_report_id(target):
-                try:
-                    ctx = await _resolve_report_context(target, section=requested_section)
-                    await _upsert_conversation(
-                        conversation_id=conv_id,
-                        user_id=user_id,
-                        chat_id=chat_id,
-                        set_context=ctx,
-                    )
-                    if chat_id:
-                        await _send_report_selector_card_if_needed(chat_id, ctx)
-                        await _send_report_module_message(chat_id=chat_id, report_ctx=ctx)
-                        reply_already_sent = True
-                    reply = f"已加载报告上下文: {ctx.get('stock_name') or ctx.get('stock_symbol')} ({ctx.get('report_id')})"
-                except Exception as exc:
-                    reply = f"加载报告上下文失败: {exc}"
-            else:
+            # 先按报告ID加载；若未命中报告，再按股票发起分析
+            try:
+                ctx = await _resolve_report_context(target, section=requested_section)
+                await _upsert_conversation(
+                    conversation_id=conv_id,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    set_context=ctx,
+                )
+                if chat_id:
+                    await _send_report_selector_card_if_needed(chat_id, ctx)
+                    await _send_report_module_message(chat_id=chat_id, report_ctx=ctx)
+                    reply_already_sent = True
+                reply = f"已加载报告上下文: {ctx.get('stock_name') or ctx.get('stock_symbol')} ({ctx.get('report_id')})"
+            except Exception:
                 try:
                     symbol, stock_name, market_type = await _resolve_stock_for_analysis(
                         target,
+                        market_hint=report_market_hint,
                         user_id=user_id,
                     )
                     reply, reply_already_sent = await _start_or_reuse_stock_analysis(
@@ -3282,7 +4228,7 @@ async def handle_feishu_event_payload(payload: Dict[str, Any]) -> Dict[str, Any]
             reply = "用法: /wl add 贵州茅台 [数量] [成本] | /wl del 600519 | /wl list"
 
     if chat_id and not reply_already_sent:
-        await feishu_push_service.send_text(chat_id, reply)
+        await feishu_push_service.send_text(chat_id, reply, reply_to_message_id=reply_to_message_id)
     await _upsert_conversation(
         conversation_id=conv_id,
         user_id=user_id,

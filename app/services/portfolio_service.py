@@ -34,7 +34,16 @@ class PortfolioService:
             for p in hk_us_positions:
                 p.stale_data = True
 
-        all_positions = cn_positions + hk_us_positions
+        # 去重合并：同 market+symbol 仅保留一条，优先使用 longport 同步数据
+        merged: Dict[tuple[str, str], UnifiedPosition] = {}
+        for p in cn_positions:
+            key = (str(p.market or "").upper(), str(p.symbol or "").upper())
+            merged[key] = p
+        for p in hk_us_positions:
+            key = (str(p.market or "").upper(), str(p.symbol or "").upper())
+            merged[key] = p
+
+        all_positions = list(merged.values())
         await self._save_snapshot(user_id, all_positions, stale)
         return all_positions
 
@@ -132,7 +141,7 @@ class PortfolioService:
         result: List[UnifiedPosition] = []
         for row in rows:
             market = str(row.get("market") or "").upper()
-            if market not in {"HK", "US"}:
+            if market not in {"CN", "HK", "US"}:
                 continue
             quantity = float(row.get("quantity") or 0.0)
             if quantity <= 0:

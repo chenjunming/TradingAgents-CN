@@ -70,38 +70,63 @@ class FeishuPushService:
     def command_response(self, text: str) -> FeishuCommandResponse:
         return FeishuCommandResponse(message_type="text", fallback_text=text)
 
-    async def send_text(self, chat_id: str, text: str) -> Dict[str, Any]:
+    async def send_text(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         # 默认使用富文本卡片（Markdown）发送；失败再降级纯文本，保证消息可达。
         card = self._build_simple_card(
             title="投研助手",
             lines=[text],
             template="blue",
         )
-        card_result = await self.send_custom_card(chat_id, card, action="send_text_as_card")
+        card_result = await self.send_custom_card(
+            chat_id,
+            card,
+            action="send_text_as_card",
+            reply_to_message_id=reply_to_message_id,
+        )
         if card_result.get("success"):
             return card_result
 
-        return await self._send_plain_text(chat_id, text)
+        return await self._send_plain_text(chat_id, text, reply_to_message_id=reply_to_message_id)
 
-    async def _send_plain_text(self, chat_id: str, text: str) -> Dict[str, Any]:
+    async def _send_plain_text(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to_message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         token = await self._get_tenant_access_token()
         if not token:
             return {"success": False, "message": "missing_feishu_credentials"}
 
         url = f"{settings.FEISHU_BOT_API_BASE}/open-apis/im/v1/messages"
-        body = {
-            "receive_id": chat_id,
-            "msg_type": "text",
-            "content": json.dumps({"text": text}, ensure_ascii=False),
-        }
+        reply_target = str(reply_to_message_id or "").strip()
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        try:
+
+        async def _post(receive_id_type: str, receive_id: str) -> Dict[str, Any]:
+            body = {
+                "receive_id": receive_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": text}, ensure_ascii=False),
+            }
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(url, params={"receive_id_type": "chat_id"}, headers=headers, json=body)
-                data = resp.json()
+                resp = await client.post(url, params={"receive_id_type": receive_id_type}, headers=headers, json=body)
+                return resp.json()
+
+        try:
+            if reply_target:
+                data = await _post("message_id", reply_target)
+                if data.get("code") != 0:
+                    data = await _post("chat_id", chat_id)
+            else:
+                data = await _post("chat_id", chat_id)
         except Exception as exc:
             data = {"code": -1, "msg": str(exc), "error_type": type(exc).__name__}
 
@@ -110,6 +135,7 @@ class FeishuPushService:
             await db.feishu_message_logs.insert_one(
                 {
                     "chat_id": chat_id,
+                    "reply_to_message_id": str(reply_to_message_id or ""),
                     "action": "send_plain_text",
                     "text": text,
                     "response": data,
@@ -121,26 +147,43 @@ class FeishuPushService:
 
         return {"success": data.get("code") == 0, "response": data}
 
-    async def send_card(self, chat_id: str, title: str, lines: list[str], template: str = "blue") -> Dict[str, Any]:
+    async def send_card(
+        self,
+        chat_id: str,
+        title: str,
+        lines: list[str],
+        template: str = "blue",
+        reply_to_message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         token = await self._get_tenant_access_token()
         if not token:
             return {"success": False, "message": "missing_feishu_credentials"}
 
         card = self._build_simple_card(title=title, lines=lines, template=template)
         url = f"{settings.FEISHU_BOT_API_BASE}/open-apis/im/v1/messages"
-        body = {
-            "receive_id": chat_id,
-            "msg_type": "interactive",
-            "content": json.dumps(card, ensure_ascii=False),
-        }
+        reply_target = str(reply_to_message_id or "").strip()
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        try:
+
+        async def _post(receive_id_type: str, receive_id: str) -> Dict[str, Any]:
+            body = {
+                "receive_id": receive_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            }
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(url, params={"receive_id_type": "chat_id"}, headers=headers, json=body)
-                data = resp.json()
+                resp = await client.post(url, params={"receive_id_type": receive_id_type}, headers=headers, json=body)
+                return resp.json()
+
+        try:
+            if reply_target:
+                data = await _post("message_id", reply_target)
+                if data.get("code") != 0:
+                    data = await _post("chat_id", chat_id)
+            else:
+                data = await _post("chat_id", chat_id)
         except Exception as exc:
             data = {"code": -1, "msg": str(exc), "error_type": type(exc).__name__}
 
@@ -149,6 +192,7 @@ class FeishuPushService:
             await db.feishu_message_logs.insert_one(
                 {
                     "chat_id": chat_id,
+                    "reply_to_message_id": str(reply_to_message_id or ""),
                     "action": "send_card",
                     "title": title,
                     "lines": lines,
@@ -161,25 +205,41 @@ class FeishuPushService:
 
         return {"success": data.get("code") == 0, "response": data}
 
-    async def send_custom_card(self, chat_id: str, card: Dict[str, Any], action: str = "send_custom_card") -> Dict[str, Any]:
+    async def send_custom_card(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        action: str = "send_custom_card",
+        reply_to_message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         token = await self._get_tenant_access_token()
         if not token:
             return {"success": False, "message": "missing_feishu_credentials"}
 
         url = f"{settings.FEISHU_BOT_API_BASE}/open-apis/im/v1/messages"
-        body = {
-            "receive_id": chat_id,
-            "msg_type": "interactive",
-            "content": json.dumps(card, ensure_ascii=False),
-        }
+        reply_target = str(reply_to_message_id or "").strip()
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        try:
+
+        async def _post(receive_id_type: str, receive_id: str) -> Dict[str, Any]:
+            body = {
+                "receive_id": receive_id,
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+            }
             async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(url, params={"receive_id_type": "chat_id"}, headers=headers, json=body)
-                data = resp.json()
+                resp = await client.post(url, params={"receive_id_type": receive_id_type}, headers=headers, json=body)
+                return resp.json()
+
+        try:
+            if reply_target:
+                data = await _post("message_id", reply_target)
+                if data.get("code") != 0:
+                    data = await _post("chat_id", chat_id)
+            else:
+                data = await _post("chat_id", chat_id)
         except Exception as exc:
             data = {"code": -1, "msg": str(exc), "error_type": type(exc).__name__}
 
@@ -188,6 +248,7 @@ class FeishuPushService:
             await db.feishu_message_logs.insert_one(
                 {
                     "chat_id": chat_id,
+                    "reply_to_message_id": str(reply_to_message_id or ""),
                     "action": action,
                     "card": card,
                     "response": data,

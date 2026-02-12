@@ -46,10 +46,34 @@ class FeishuNLAgentService:
             "desc": "查看统一持仓",
         },
         {
+            "action": "sync_longport_positions",
+            "api": "POST /api/paper/sync/longport/positions",
+            "params": ["symbols?", "replace_existing_longport_positions?", "sync_cash?"],
+            "desc": "从长桥同步持仓到纸上账户",
+        },
+        {
+            "action": "feedback_metrics",
+            "api": "internal:/feedback [YYYY-MM]",
+            "params": ["month_key?"],
+            "desc": "查看持续评估统计（胜率/回撤/归因）",
+        },
+        {
+            "action": "list_history_reports",
+            "api": "internal:/history [股票代码|股票名称|analysis_id] [数量]",
+            "params": ["report_keyword?", "limit?"],
+            "desc": "查看历史报告列表",
+        },
+        {
             "action": "run_stock_analysis",
             "api": "internal:/report <代码|名称|analysis_id> (扩展为触发个股分析并回传报告)",
             "params": ["stock_name_or_code", "market?", "research_depth?", "force_refresh?"],
             "desc": "发起个股分析任务，返回进度和最终报告",
+        },
+        {
+            "action": "run_positions_batch_analysis",
+            "api": "internal:/reportpos [数量] [A股,港股,美股] [快速|基础|标准|深度|全面] [force]",
+            "params": ["limit?", "markets?", "research_depth?", "force_refresh?"],
+            "desc": "基于当前持仓批量发起个股分析",
         },
         {
             "action": "run_stock_screening",
@@ -88,8 +112,13 @@ class FeishuNLAgentService:
         "/pick",
         "/rebalance",
         "/position",
+        "/syncpos [symbols可选]",
+        "/feedback [YYYY-MM]",
+        "/history [股票代码|股票名称|analysis_id] [数量]",
         "/report <代码|名称> [快速|基础|标准|深度|全面] [force]",
+        "/reportpos [数量] [A股,港股,美股] [快速|基础|标准|深度|全面] [force]",
         "/report <analysis_id> [模块]",
+        "/reportid <analysis_id> [模块]",
         "/screen [价值|质量|动量] [数量] [A股,港股,美股]",
         "/wl list",
         "/wl add <股票> [数量] [成本]",
@@ -103,7 +132,11 @@ class FeishuNLAgentService:
         "daily_picks",
         "rebalance_suggestions",
         "positions_snapshot",
+        "sync_longport_positions",
+        "feedback_metrics",
+        "list_history_reports",
         "run_stock_analysis",
+        "run_positions_batch_analysis",
         "run_stock_screening",
         "add_watchlist",
         "remove_watchlist",
@@ -117,7 +150,14 @@ class FeishuNLAgentService:
         "daily_picks": {"required": [], "optional": []},
         "rebalance_suggestions": {"required": [], "optional": []},
         "positions_snapshot": {"required": [], "optional": []},
+        "sync_longport_positions": {
+            "required": [],
+            "optional": ["symbols", "replace_existing_longport_positions", "sync_cash"],
+        },
+        "feedback_metrics": {"required": [], "optional": ["month_key"]},
+        "list_history_reports": {"required": [], "optional": ["report_keyword", "limit"]},
         "run_stock_analysis": {"required": ["stock_name_or_code"], "optional": ["market", "research_depth", "force_refresh"]},
+        "run_positions_batch_analysis": {"required": [], "optional": ["limit", "markets", "research_depth", "force_refresh"]},
         "run_stock_screening": {"required": [], "optional": ["strategy", "limit", "markets"]},
         "add_watchlist": {"required": ["stock_name_or_code"], "optional": []},
         "remove_watchlist": {"required": ["stock_name_or_code"], "optional": []},
@@ -175,9 +215,10 @@ class FeishuNLAgentService:
             },
             {
                 "name": "投研摘要与调仓",
-                "usage": "/daily | /pick | /rebalance | /position",
+                "usage": "/daily | /pick | /rebalance | /position | /syncpos",
                 "details": [
                     "提供今日摘要、候选建议、调仓建议、持仓快照",
+                    "支持从长桥同步持仓到纸上账户（默认同步现金并替换旧 longport 持仓）",
                 ],
             },
         ],
@@ -328,10 +369,36 @@ class FeishuNLAgentService:
         text = (text or "").strip()
         if not text:
             return {"mode": "chat", "reply": "你可以告诉我你的投资操作需求。"}
-        if self._is_capability_question(text):
-            return {"mode": "chat", "reply": self._build_capability_reply()}
+        if self._is_history_report_query(text):
+            params: Dict[str, Any] = {}
+            history_kw = self._extract_history_report_keyword(text)
+            if history_kw:
+                params["report_keyword"] = history_kw
+            return {
+                "mode": "action",
+                "action": "list_history_reports",
+                "params": params,
+                "instruction": self._action_to_instruction("list_history_reports", params),
+            }
 
-        # 高置信规则优先：减少LLM路由开销并避免关键指令被误判
+        # AI 驱动优先（默认开启），规则匹配仅作为可选兜底
+        ai_driven_routing = self._is_true(os.getenv("FEISHU_AGENT_AI_DRIVEN_ROUTING", "true"), default=True)
+        rule_fallback = self._is_true(os.getenv("FEISHU_AGENT_RULE_FALLBACK", "false"), default=False)
+
+        if enable_llm_route and ai_driven_routing:
+            llm_result = self._llm_route(text)
+            if llm_result is not None:
+                normalized = self._normalize_llm_intent(text, llm_result)
+                if normalized is not None:
+                    if normalized.get("mode") == "action":
+                        action = str(normalized.get("action") or "")
+                        params = normalized.get("params") if isinstance(normalized.get("params"), dict) else {}
+                        normalized["instruction"] = self._action_to_instruction(action, params)
+                    return normalized
+            if not rule_fallback:
+                return {"mode": "chat"}
+
+        # 规则路由（非 AI 驱动模式或显式开启兜底时生效）
         rule_result = self._rule_route(text)
         if rule_result is not None and str(rule_result.get("action") or "") in {
             "set_report_context",
@@ -348,7 +415,7 @@ class FeishuNLAgentService:
                 normalized_rule["instruction"] = self._action_to_instruction(action, params)
             return normalized_rule
 
-        # 非连续对话使用 LLM 路由；连续会话可关闭以节省 token
+        # 非 AI 驱动模式下，LLM 路由作为补充
         if enable_llm_route:
             llm_result = self._llm_route(text)
             if llm_result is not None:
@@ -368,7 +435,7 @@ class FeishuNLAgentService:
                 normalized_rule["instruction"] = self._action_to_instruction(action, params)
             return normalized_rule
 
-        return {"mode": "chat", "reply": self._default_chat_reply()}
+        return {"mode": "chat"}
 
     def _normalize_llm_intent(self, text: str, llm_result: Dict[str, Any]) -> Dict[str, Any] | None:
         if not isinstance(llm_result, dict):
@@ -377,9 +444,9 @@ class FeishuNLAgentService:
         mode = str(llm_result.get("mode") or "").strip()
         if mode == "chat":
             reply = llm_result.get("reply")
-            if not isinstance(reply, str) or not reply.strip():
-                reply = self._default_chat_reply()
-            return {"mode": "chat", "reply": reply.strip()}
+            if isinstance(reply, str) and reply.strip():
+                return {"mode": "chat", "reply": reply.strip()}
+            return {"mode": "chat"}
 
         if mode != "action":
             return None
@@ -423,6 +490,10 @@ class FeishuNLAgentService:
                 current = str(params.get("stock_name_or_code") or "").strip()
                 if (not current) or (current == raw_stock_param) or (self._strip_market_suffix(current) == stock):
                     params["stock_name_or_code"] = stock
+                if not params.get("market"):
+                    inferred_market_from_stock = self._infer_market_from_stock_token(stock)
+                    if inferred_market_from_stock:
+                        params["market"] = inferred_market_from_stock
             if market and not params.get("market"):
                 params["market"] = market
             if depth and not params.get("research_depth"):
@@ -470,11 +541,21 @@ class FeishuNLAgentService:
                 markets = self._extract_screening_markets(text)
             if markets:
                 params["markets"] = markets
+        elif action == "list_history_reports":
+            keyword = str(params.get("report_keyword") or "").strip()
+            if keyword:
+                params["report_keyword"] = keyword
+            try:
+                limit = int(float(str(params.get("limit")).strip())) if params.get("limit") is not None else None
+            except Exception:
+                limit = None
+            if limit is not None:
+                params["limit"] = max(1, min(30, int(limit)))
 
         missing = [k for k in required_params if not str(params.get(k) or "").strip()]
         if missing:
             # 关键参数缺失时不执行动作，回退自然对话避免误操作
-            return {"mode": "chat", "reply": self._default_chat_reply()}
+            return {"mode": "chat"}
 
         return {"mode": "action", "action": action, "params": params}
 
@@ -499,6 +580,25 @@ class FeishuNLAgentService:
             return "/rebalance"
         if a == "positions_snapshot":
             return "/position"
+        if a == "sync_longport_positions":
+            symbols = p.get("symbols")
+            if isinstance(symbols, list):
+                clean = [str(x).strip() for x in symbols if str(x).strip()]
+                if clean:
+                    return "/syncpos " + ",".join(clean)
+            return "/syncpos"
+        if a == "feedback_metrics":
+            month_key = str(p.get("month_key") or "").strip()
+            return f"/feedback {month_key}" if month_key else "/feedback"
+        if a == "list_history_reports":
+            keyword = str(p.get("report_keyword") or "").strip()
+            limit = p.get("limit")
+            parts = ["/history"]
+            if keyword:
+                parts.append(keyword)
+            if limit is not None and str(limit).strip():
+                parts.append(str(limit))
+            return " ".join(parts)
         if a == "list_watchlist":
             return "/wl list"
         if a == "add_watchlist":
@@ -535,6 +635,17 @@ class FeishuNLAgentService:
             parts = ["/report", stock]
             if market and not normalized_symbol:
                 parts.append(market)
+            if depth:
+                parts.append(depth)
+            if force:
+                parts.append("force")
+            return " ".join(parts)
+        if a == "run_positions_batch_analysis":
+            limit = self._normalize_screening_limit(p.get("limit")) or 5
+            markets = self._normalize_screening_markets(p.get("markets")) or ["A股", "港股", "美股"]
+            depth = self._normalize_research_depth(str(p.get("research_depth") or "")) or ""
+            force = bool(p.get("force_refresh"))
+            parts = ["/reportpos", str(limit), ",".join(markets)]
             if depth:
                 parts.append(depth)
             if force:
@@ -589,6 +700,12 @@ class FeishuNLAgentService:
         raw = str(token or "").strip()
         if not raw:
             return None
+        # 常见美股 ticker（如 AAPL/VRT）
+        if re.fullmatch(r"[A-Za-z]{1,5}", raw):
+            return "美股"
+        # 常见港股数字代码（如 700/00700）
+        if re.fullmatch(r"\d{4,5}", raw):
+            return "港股"
         if re.search(r"^\s*hk(?=[\u4e00-\u9fa5\d])", raw, flags=re.IGNORECASE) or re.search(
             r"(?<=[\u4e00-\u9fa5\d])\s*hk\s*$",
             raw,
@@ -679,6 +796,46 @@ class FeishuNLAgentService:
                 kw = self._strip_market_suffix(m.group(1))
                 if kw:
                     return kw
+        return None
+
+    @staticmethod
+    def _is_history_report_query(text: str) -> bool:
+        t = str(text or "").strip()
+        if not t:
+            return False
+        if not re.search(r"(报告|analysis)", t, flags=re.IGNORECASE):
+            return False
+        return bool(
+            re.search(r"(历史|之前|过往|以前).*(分析)?报告", t)
+            or re.search(r"(分析)?历史报告", t)
+            or re.search(r"(查看|查|查询|找|列出).*(历史|之前|过往|以前).*(报告|analysis)", t)
+        )
+
+    def _extract_history_report_keyword(self, text: str) -> str | None:
+        t = str(text or "").strip()
+        if not t:
+            return None
+
+        m_symbol = re.search(r"\b([A-Za-z]{1,6}(?:\.HK)?)\b", t)
+        if m_symbol:
+            return m_symbol.group(1).upper()
+
+        m_a = re.search(r"\b(\d{6})\b", t)
+        if m_a:
+            return m_a.group(1)
+
+        patterns = [
+            r"(?:查看|看看|查下|查询|找下|找找|列出|帮我查看下|帮我看下|帮我查下)\s*(.+?)\s*(?:之前|历史|过往|以前).*(?:分析)?报告",
+            r"(?:查看|看看|查下|查询|找下|找找|列出)\s*(.+?)\s*(?:分析)?历史报告",
+        ]
+        for p in patterns:
+            m = re.search(p, t, flags=re.IGNORECASE)
+            if not m:
+                continue
+            kw = self._strip_market_suffix(str(m.group(1) or "").strip())
+            kw = re.sub(r"^(?:一下|下|关于|有关)\s*", "", kw)
+            if kw and kw not in {"我", "我们", "之前", "历史报告", "分析报告"}:
+                return kw
         return None
 
     def _extract_stock_from_analysis(self, text: str) -> tuple[str | None, str | None, str | None, bool]:
@@ -865,6 +1022,25 @@ class FeishuNLAgentService:
                     "params": params,
                 }
 
+        if re.search(r"(持仓|仓位).*(批量|一键|全部).*(分析|研究)", t) or re.search(r"(批量|一键).*(分析|研究).*(持仓|仓位)", t):
+            params: Dict[str, Any] = {}
+            limit = self._extract_screening_limit(t)
+            if limit is not None:
+                params["limit"] = max(1, min(20, int(limit)))
+            markets = self._extract_screening_markets(t)
+            if markets:
+                params["markets"] = markets
+            depth = self._extract_research_depth(t)
+            if depth:
+                params["research_depth"] = depth
+            if self._extract_force_refresh(t):
+                params["force_refresh"] = True
+            return {
+                "mode": "action",
+                "action": "run_positions_batch_analysis",
+                "params": params,
+            }
+
         if re.search(r"(选股|筛选|找股票|找标的|选.*股票|各选)", t):
             params: Dict[str, Any] = {}
             strategy = self._infer_screening_strategy(t)
@@ -877,6 +1053,13 @@ class FeishuNLAgentService:
                 "mode": "action",
                 "action": "run_stock_screening",
                 "params": params,
+            }
+
+        if re.search(r"(同步|刷新|更新).*(长桥|longport).*(持仓|仓位)", t, flags=re.IGNORECASE):
+            return {
+                "mode": "action",
+                "action": "sync_longport_positions",
+                "params": {},
             }
 
         return None

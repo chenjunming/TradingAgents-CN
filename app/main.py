@@ -84,6 +84,7 @@ from app.services.quotes_ingestion_service import QuotesIngestionService
 from app.services.market_push_schedule_service import market_push_schedule_service
 from app.services.feishu_stream_service import feishu_stream_service
 from app.services.simple_analysis_service import get_simple_analysis_service
+from app.services.analysis_feedback_service import get_analysis_feedback_service
 from app.routers import paper as paper_router
 
 
@@ -805,6 +806,44 @@ async def lifespan(app: FastAPI):
             if settings.ANALYSIS_ZOMBIE_CLEANUP_RUN_ON_STARTUP:
                 asyncio.create_task(run_analysis_zombie_cleanup())
                 logger.info("🚀 启动时执行一次分析僵尸任务清理")
+
+        # 分析结果长期反馈评估任务（持续迭代复盘，不固定验证天数）
+        async def run_analysis_feedback_evaluator():
+            try:
+                feedback_service = get_analysis_feedback_service()
+                result = await feedback_service.run_due_feedback_jobs(
+                    batch_size=settings.ANALYSIS_FEEDBACK_BATCH_SIZE
+                )
+                processed = int(result.get("processed", 0))
+                if processed > 0:
+                    logger.info(
+                        "🧠 分析反馈评估执行完成: processed=%s closed=%s errors=%s",
+                        processed,
+                        result.get("closed", 0),
+                        result.get("errors", 0),
+                    )
+            except Exception as e:
+                logger.error(f"❌ 分析反馈评估任务失败: {e}", exc_info=True)
+
+        scheduler.add_job(
+            run_analysis_feedback_evaluator,
+            IntervalTrigger(
+                minutes=settings.ANALYSIS_FEEDBACK_SCAN_INTERVAL_MINUTES,
+                timezone=settings.TIMEZONE,
+            ),
+            id="analysis_feedback_evaluator",
+            name="分析结果长期反馈评估器",
+        )
+        if not settings.ANALYSIS_FEEDBACK_ENABLED:
+            scheduler.pause_job("analysis_feedback_evaluator")
+            logger.info("⏸️ 分析反馈评估器已添加但暂停")
+        else:
+            logger.info(
+                f"🧠 分析反馈评估器已启动: 每{settings.ANALYSIS_FEEDBACK_SCAN_INTERVAL_MINUTES}分钟扫描"
+            )
+            if settings.ANALYSIS_FEEDBACK_RUN_ON_STARTUP:
+                asyncio.create_task(run_analysis_feedback_evaluator())
+                logger.info("🚀 启动时执行一次分析反馈评估")
 
         scheduler.start()
 

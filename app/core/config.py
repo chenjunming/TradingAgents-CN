@@ -195,6 +195,23 @@ class Settings(BaseSettings):
     ANALYSIS_ZOMBIE_CLEANUP_RUN_ON_STARTUP: bool = Field(default=True)
     ANALYSIS_ZOMBIE_CLEANUP_INTERVAL_MINUTES: int = Field(default=30, ge=5, le=1440)
     ANALYSIS_ZOMBIE_MAX_RUNNING_HOURS: int = Field(default=2, ge=1, le=168)
+    # 分析反馈长期评估（用于持续复盘，不固定 30 天）
+    ANALYSIS_FEEDBACK_ENABLED: bool = Field(default=True)
+    ANALYSIS_FEEDBACK_RUN_ON_STARTUP: bool = Field(default=True)
+    ANALYSIS_FEEDBACK_SCAN_INTERVAL_MINUTES: int = Field(default=60, ge=1, le=1440)
+    ANALYSIS_FEEDBACK_INTERVAL_DAYS: int = Field(default=7, ge=1, le=365)
+    ANALYSIS_FEEDBACK_MAX_TRACKING_DAYS: int = Field(default=730, ge=7, le=3650)
+    ANALYSIS_FEEDBACK_MAX_EVALUATIONS: int = Field(default=200, ge=1, le=10000)
+    ANALYSIS_FEEDBACK_HOLD_TOLERANCE_PCT: float = Field(default=3.0, ge=0.0, le=100.0)
+    ANALYSIS_FEEDBACK_MIN_EFFECTIVE_CHANGE_PCT: float = Field(default=0.2, ge=0.0, le=100.0)
+    ANALYSIS_FEEDBACK_STOP_GAIN_PCT: float = Field(default=15.0, ge=0.0, le=500.0)
+    ANALYSIS_FEEDBACK_STOP_LOSS_PCT: float = Field(default=8.0, ge=0.0, le=500.0)
+    ANALYSIS_FEEDBACK_TIME_TAKE_PROFIT_DAYS: int = Field(default=30, ge=1, le=3650)
+    ANALYSIS_FEEDBACK_MAX_HOLDING_DAYS: int = Field(default=180, ge=1, le=3650)
+    ANALYSIS_FEEDBACK_MEMORY_WRITE_ENABLED: bool = Field(default=True)
+    ANALYSIS_FEEDBACK_MEMORY_MIN_DAYS_BETWEEN_WRITES: int = Field(default=14, ge=0, le=3650)
+    ANALYSIS_FEEDBACK_MEMORY_MIN_RETURN_DELTA_PCT: float = Field(default=1.0, ge=0.0, le=100.0)
+    ANALYSIS_FEEDBACK_BATCH_SIZE: int = Field(default=50, ge=1, le=1000)
 
     # 实时行情入库任务
     QUOTES_INGEST_ENABLED: bool = Field(default=True)

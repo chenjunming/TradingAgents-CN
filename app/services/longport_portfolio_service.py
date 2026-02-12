@@ -75,46 +75,46 @@ class LongPortPortfolioService:
         cfg = Config.from_env()
         positions: List[UnifiedPosition] = []
 
-        with TradeContext(cfg) as ctx:
-            raw_positions = ctx.stock_positions() or []
-            for item in raw_positions:
-                symbol_raw = self._attr(item, "symbol", "stock_symbol")
-                code, market = self._parse_symbol(symbol_raw)
-                if market not in {"HK", "US"}:
-                    continue
+        ctx = TradeContext(cfg)
+        raw_positions = ctx.stock_positions() or []
+        for item in raw_positions:
+            symbol_raw = self._attr(item, "symbol", "stock_symbol")
+            code, market = self._parse_symbol(symbol_raw)
+            if market not in {"HK", "US"}:
+                continue
 
-                quantity = self._safe_float(self._attr(item, "quantity", "qty", "total_qty")) or 0.0
-                current_price = self._safe_float(self._attr(item, "last_done", "current_price", "market_price"))
-                avg_cost = self._safe_float(self._attr(item, "cost_price", "avg_price", "average_cost"))
-                market_value = self._safe_float(self._attr(item, "market_value", "position_value"))
-                pnl = self._safe_float(self._attr(item, "unrealized_pnl", "unrealized_pl", "profit"))
-                pnl_pct = self._safe_float(self._attr(item, "unrealized_pnl_ratio", "profit_ratio"))
+            quantity = self._safe_float(self._attr(item, "quantity", "qty", "total_qty")) or 0.0
+            current_price = self._safe_float(self._attr(item, "last_done", "current_price", "market_price"))
+            avg_cost = self._safe_float(self._attr(item, "cost_price", "avg_price", "average_cost"))
+            market_value = self._safe_float(self._attr(item, "market_value", "position_value"))
+            pnl = self._safe_float(self._attr(item, "unrealized_pnl", "unrealized_pl", "profit"))
+            pnl_pct = self._safe_float(self._attr(item, "unrealized_pnl_ratio", "profit_ratio"))
 
-                if market_value is None and current_price is not None:
-                    market_value = current_price * quantity
-                if pnl is None and market_value is not None and avg_cost is not None:
-                    pnl = market_value - (avg_cost * quantity)
-                if pnl_pct is None and pnl is not None and avg_cost and quantity:
-                    base = avg_cost * quantity
-                    pnl_pct = (pnl / base) * 100 if base else None
+            if market_value is None and current_price is not None:
+                market_value = current_price * quantity
+            if pnl is None and market_value is not None and avg_cost is not None:
+                pnl = market_value - (avg_cost * quantity)
+            if pnl_pct is None and pnl is not None and avg_cost and quantity:
+                base = avg_cost * quantity
+                pnl_pct = (pnl / base) * 100 if base else None
 
-                positions.append(
-                    UnifiedPosition(
-                        symbol=code,
-                        name=str(self._attr(item, "name", "stock_name") or ""),
-                        market=market,
-                        quantity=quantity,
-                        available_quantity=self._safe_float(self._attr(item, "available_quantity", "available_qty")),
-                        avg_cost=avg_cost,
-                        current_price=current_price,
-                        market_value=market_value,
-                        pnl=pnl,
-                        pnl_pct=pnl_pct,
-                        currency="HKD" if market == "HK" else "USD",
-                        source="longport",
-                        stale_data=False,
-                    )
+            positions.append(
+                UnifiedPosition(
+                    symbol=code,
+                    name=str(self._attr(item, "name", "stock_name") or ""),
+                    market=market,
+                    quantity=quantity,
+                    available_quantity=self._safe_float(self._attr(item, "available_quantity", "available_qty")),
+                    avg_cost=avg_cost,
+                    current_price=current_price,
+                    market_value=market_value,
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
+                    currency="HKD" if market == "HK" else "USD",
+                    source="longport",
+                    stale_data=False,
                 )
+            )
 
         return positions
 

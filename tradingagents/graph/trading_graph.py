@@ -804,7 +804,7 @@ class TradingAgentsGraph:
         # Initialize memories (如果启用)
         memory_enabled = self.config.get("memory_enabled", True)
         if memory_enabled:
-            # 使用单例ChromaDB管理器，避免并发创建冲突
+            # 使用 OpenMemory 作为统一长期记忆后端
             self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
             self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
             self.trader_memory = FinancialSituationMemory("trader_memory", self.config)
@@ -916,7 +916,7 @@ class TradingAgentsGraph:
             ),
         }
 
-    def propagate(self, company_name, trade_date, progress_callback=None, task_id=None):
+    def propagate(self, company_name, trade_date, progress_callback=None, task_id=None, position_context=None):
         """Run the trading agents graph for a company on a specific date.
 
         Args:
@@ -924,6 +924,7 @@ class TradingAgentsGraph:
             trade_date: Date for analysis
             progress_callback: Optional callback function for progress updates
             task_id: Optional task ID for tracking performance data
+            position_context: Optional user position context for prompt injection
         """
 
         # 添加详细的接收日志
@@ -938,7 +939,7 @@ class TradingAgentsGraph:
         # Initialize state
         logger.debug(f"🔍 [GRAPH DEBUG] 创建初始状态，传递参数: company_name='{company_name}', trade_date='{trade_date}'")
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date
+            company_name, trade_date, position_context=position_context
         )
         logger.debug(f"🔍 [GRAPH DEBUG] 初始状态中的company_of_interest: '{init_agent_state.get('company_of_interest', 'NOT_FOUND')}'")
         logger.debug(f"🔍 [GRAPH DEBUG] 初始状态中的trade_date: '{init_agent_state.get('trade_date', 'NOT_FOUND')}'")
@@ -1423,21 +1424,26 @@ class TradingAgentsGraph:
 
     def reflect_and_remember(self, returns_losses):
         """Reflect on decisions and update memory based on returns."""
-        self.reflector.reflect_bull_researcher(
-            self.curr_state, returns_losses, self.bull_memory
-        )
-        self.reflector.reflect_bear_researcher(
-            self.curr_state, returns_losses, self.bear_memory
-        )
-        self.reflector.reflect_trader(
-            self.curr_state, returns_losses, self.trader_memory
-        )
-        self.reflector.reflect_invest_judge(
-            self.curr_state, returns_losses, self.invest_judge_memory
-        )
-        self.reflector.reflect_risk_manager(
-            self.curr_state, returns_losses, self.risk_manager_memory
-        )
+        if not self.curr_state:
+            logger.warning("⚠️ 反思跳过：当前状态为空")
+            return
+
+        reflection_tasks = [
+            ("bull", self.reflector.reflect_bull_researcher, self.bull_memory),
+            ("bear", self.reflector.reflect_bear_researcher, self.bear_memory),
+            ("trader", self.reflector.reflect_trader, self.trader_memory),
+            ("invest_judge", self.reflector.reflect_invest_judge, self.invest_judge_memory),
+            ("risk_manager", self.reflector.reflect_risk_manager, self.risk_manager_memory),
+        ]
+
+        for name, reflect_fn, memory_obj in reflection_tasks:
+            if memory_obj is None:
+                logger.info(f"ℹ️ 反思跳过：{name} 记忆对象不可用")
+                continue
+            try:
+                reflect_fn(self.curr_state, returns_losses, memory_obj)
+            except Exception as e:
+                logger.warning(f"⚠️ {name} 反思写入失败(已忽略): {e}")
 
     def process_signal(self, full_signal, stock_symbol=None):
         """Process a signal to extract the core decision."""

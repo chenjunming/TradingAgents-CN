@@ -394,17 +394,63 @@ class ForeignStockService:
             if not quote_data:
                 raise Exception(f"无法获取美股{code}的行情数据：所有数据源均失败")
 
+            def _safe_pct(value):
+                if value is None:
+                    return None
+                if isinstance(value, str):
+                    s = value.strip().replace("%", "")
+                    if not s:
+                        return None
+                    try:
+                        return float(s)
+                    except Exception:
+                        return None
+                try:
+                    return float(value)
+                except Exception:
+                    return None
+
+            price = quote_data.get('price')
+            try:
+                price = float(price) if price is not None else None
+            except Exception:
+                price = None
+            pre_close = (
+                quote_data.get('pre_close')
+                or quote_data.get('prev_close')
+                or quote_data.get('previous_close')
+                or quote_data.get('pc')
+            )
+            try:
+                pre_close = float(pre_close) if pre_close is not None else None
+            except Exception:
+                pre_close = None
+            pct = None
+            if price is not None and pre_close not in (None, 0, 0.0):
+                try:
+                    pct = (price / pre_close - 1.0) * 100.0
+                except Exception:
+                    pct = None
+            if pct is None:
+                pct = _safe_pct(
+                    quote_data.get('pct_chg')
+                    if quote_data.get('pct_chg') is not None
+                    else quote_data.get('change_percent')
+                )
+
             # 5. 格式化数据
             formatted_data = {
                 'code': code,
                 'name': quote_data.get('name', f'美股{code}'),
                 'market': 'US',
-                'price': quote_data.get('price'),
+                'price': price if price is not None else quote_data.get('price'),
                 'open': quote_data.get('open'),
                 'high': quote_data.get('high'),
                 'low': quote_data.get('low'),
                 'volume': quote_data.get('volume'),
-                'change_percent': quote_data.get('change_percent'),
+                'pre_close': pre_close,
+                'pct_chg': pct,
+                'change_percent': pct,
                 'trade_date': quote_data.get('trade_date'),
                 'currency': quote_data.get('currency', 'USD'),
                 'source': data_source,
@@ -426,13 +472,31 @@ class ForeignStockService:
         import yfinance as yf
 
         ticker = yf.Ticker(code)
-        hist = ticker.history(period='1d')
+        hist = ticker.history(period='5d')
 
         if hist.empty:
             raise Exception("无数据")
 
         latest = hist.iloc[-1]
         info = ticker.info
+        prev_close = None
+        if len(hist) >= 2:
+            try:
+                prev_close = float(hist.iloc[-2]['Close'])
+            except Exception:
+                prev_close = None
+        if prev_close in (None, 0, 0.0):
+            try:
+                prev_close = float(info.get('previousClose')) if info.get('previousClose') is not None else None
+            except Exception:
+                prev_close = None
+
+        change_percent = None
+        try:
+            if prev_close not in (None, 0, 0.0):
+                change_percent = (float(latest['Close']) / float(prev_close) - 1.0) * 100.0
+        except Exception:
+            change_percent = None
 
         return {
             'name': info.get('longName') or info.get('shortName'),
@@ -441,7 +505,8 @@ class ForeignStockService:
             'high': float(latest['High']),
             'low': float(latest['Low']),
             'volume': int(latest['Volume']),
-            'change_percent': round(((latest['Close'] - latest['Open']) / latest['Open'] * 100), 2),
+            'pre_close': prev_close,
+            'change_percent': change_percent,
             'trade_date': hist.index[-1].strftime('%Y-%m-%d'),
             'currency': info.get('currency', 'USD')
         }

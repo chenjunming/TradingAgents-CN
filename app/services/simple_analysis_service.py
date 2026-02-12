@@ -6,6 +6,7 @@
 import asyncio
 import uuid
 import logging
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -783,6 +784,131 @@ class SimpleAnalysisService:
             request.stock_code = stock_code
         return stock_code
 
+    @staticmethod
+    def _market_to_code(market_type: str) -> str:
+        s = str(market_type or "").strip().upper()
+        if s in {"港股", "HK", "HONG_KONG"}:
+            return "HK"
+        if s in {"美股", "US", "USA"}:
+            return "US"
+        return "CN"
+
+    @staticmethod
+    def _normalize_symbol_for_market(stock_code: str, market_code: str) -> str:
+        raw = str(stock_code or "").strip().upper()
+        base = raw.split(".", 1)[0] if "." in raw else raw
+        if market_code == "HK":
+            digits = "".join(ch for ch in base if ch.isdigit())
+            return digits.zfill(5) if digits else base
+        if market_code == "CN":
+            digits = "".join(ch for ch in base if ch.isdigit())
+            return digits.zfill(6) if digits else base
+        return re.sub(r"\.US$", "", base, flags=re.IGNORECASE).upper()
+
+    def _build_position_context_for_analysis(
+        self,
+        user_id: str,
+        stock_code: str,
+        market_type: str,
+    ) -> Optional[str]:
+        """构建“当前标的持仓”上下文，用于注入分析提示词。"""
+        market_code = self._market_to_code(market_type)
+        norm_code = self._normalize_symbol_for_market(stock_code, market_code)
+
+        if not norm_code:
+            return None
+
+        try:
+            if market_code in {"HK", "US"}:
+                from app.core.config import settings
+                from pymongo import MongoClient
+
+                client = MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=5000)
+                db = client[settings.MONGO_DB]
+                row = db.paper_positions.find_one(
+                    {"user_id": user_id, "market": market_code, "code": norm_code},
+                    {"_id": 0, "quantity": 1, "avg_cost": 1, "market_value": 1, "currency": 1},
+                )
+                if not row:
+                    client.close()
+                    return (
+                        f"用户当前在{market_code}市场未持有标的 {norm_code}。"
+                    )
+
+                qty = float(row.get("quantity") or 0.0)
+                avg_cost = row.get("avg_cost")
+                avg_cost_f = float(avg_cost) if avg_cost is not None else None
+                market_value = row.get("market_value")
+                market_value_f = float(market_value) if market_value is not None else (
+                    (avg_cost_f * qty) if avg_cost_f is not None else None
+                )
+
+                cursor = db.paper_positions.find(
+                    {"user_id": user_id, "market": market_code},
+                    {"_id": 0, "quantity": 1, "avg_cost": 1, "market_value": 1},
+                )
+                total_mv = 0.0
+                for it in cursor:
+                    it_mv = it.get("market_value")
+                    if it_mv is not None:
+                        total_mv += float(it_mv)
+                    else:
+                        it_qty = float(it.get("quantity") or 0.0)
+                        it_cost = it.get("avg_cost")
+                        if it_cost is not None:
+                            total_mv += float(it_cost) * it_qty
+                client.close()
+
+                weight_pct = None
+                if market_value_f is not None and total_mv > 0:
+                    weight_pct = market_value_f / total_mv * 100.0
+
+                return (
+                    f"用户当前持仓（{market_code}）: 标的={norm_code}; "
+                    f"持股数={qty:g}; "
+                    f"持仓成本={'-' if avg_cost_f is None else f'{avg_cost_f:.4f}'}; "
+                    f"持仓占比(市场内)={'-' if weight_pct is None else f'{weight_pct:.2f}%'}。"
+                )
+
+            # A股：来源于 sqlite 持仓
+            from app.services.a_share_sqlite_service import get_a_share_sqlite_service
+            positions = get_a_share_sqlite_service().list_positions()
+            target = None
+            for p in positions:
+                if str(p.symbol or "").zfill(6) == norm_code:
+                    target = p
+                    break
+            if not target:
+                return f"用户当前在A股市场未持有标的 {norm_code}。"
+
+            qty = float(target.quantity or 0.0)
+            avg_cost_f = float(target.avg_cost) if target.avg_cost is not None else None
+            mv = float(target.market_value) if target.market_value is not None else (
+                (avg_cost_f * qty) if avg_cost_f is not None else None
+            )
+
+            total_mv = 0.0
+            for p in positions:
+                p_mv = float(p.market_value) if p.market_value is not None else None
+                if p_mv is not None:
+                    total_mv += p_mv
+                elif p.avg_cost is not None:
+                    total_mv += float(p.avg_cost) * float(p.quantity or 0.0)
+
+            weight_pct = None
+            if mv is not None and total_mv > 0:
+                weight_pct = mv / total_mv * 100.0
+
+            return (
+                f"用户当前持仓（CN）: 标的={norm_code}; "
+                f"持股数={qty:g}; "
+                f"持仓成本={'-' if avg_cost_f is None else f'{avg_cost_f:.4f}'}; "
+                f"持仓占比(市场内)={'-' if weight_pct is None else f'{weight_pct:.2f}%'}。"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ 构建持仓上下文失败（已忽略）: {e}")
+            return None
+
     async def create_analysis_task(
         self,
         user_id: str,
@@ -1042,6 +1168,19 @@ class SimpleAnalysisService:
             except Exception as save_error:
                 logger.error(f"❌ 保存分析结果失败: {task_id} - {save_error}")
                 # 保存失败不影响分析完成状态
+
+            # 注册长期反馈评估任务（用于持续复盘与记忆迭代）
+            try:
+                from app.services.analysis_feedback_service import get_analysis_feedback_service
+                feedback_service = get_analysis_feedback_service()
+                await feedback_service.register_analysis_feedback_job(
+                    task_id=task_id,
+                    user_id=user_id,
+                    result=result,
+                    memory_enabled=True,
+                )
+            except Exception as feedback_error:
+                logger.warning(f"⚠️ 注册长期反馈任务失败(已忽略): {task_id} - {feedback_error}")
 
             # 🔍 调试：检查即将保存到内存的result
             logger.info(f"🔍 [DEBUG] 即将保存到内存的result键: {list(result.keys())}")
@@ -1580,14 +1719,42 @@ class SimpleAnalysisService:
             logger.info(f"🚀 准备调用 trading_graph.propagate，progress_callback={graph_progress_callback}")
 
             # 执行实际分析，传递进度回调和task_id
+            position_context = self._build_position_context_for_analysis(
+                user_id=user_id,
+                stock_code=request.stock_code or "",
+                market_type=market_type,
+            )
             state, decision = trading_graph.propagate(
                 request.stock_code,
                 analysis_date,
                 progress_callback=graph_progress_callback,
-                task_id=task_id
+                task_id=task_id,
+                position_context=position_context,
             )
 
             logger.info(f"✅ trading_graph.propagate 执行完成")
+
+            # 启用记忆时，基于本次分析结果进行反思并写入记忆库
+            # 说明：当前单次分析流程没有真实收益回放数据，使用描述性占位值。
+            if config.get("memory_enabled", False):
+                try:
+                    from app.core.config import settings as app_settings
+
+                    # 启用长期反馈评估时，跳过占位反思，避免写入噪声记忆；
+                    # 真实收益会由分析反馈评估器按周期写入记忆。
+                    if app_settings.ANALYSIS_FEEDBACK_ENABLED:
+                        logger.info("🧠 已启用长期反馈评估，跳过即时占位反思")
+                    else:
+                        if progress_tracker:
+                            progress_tracker.update_progress("🧠 生成反思记忆")
+                        update_progress_sync(88, "🧠 生成反思记忆", "memory_reflection")
+
+                        reflection_returns = "N/A (single-run analysis; realized returns unavailable)"
+                        trading_graph.reflect_and_remember(reflection_returns)
+                        logger.info("✅ 记忆反思写入完成")
+                except Exception as memory_err:
+                    # 记忆写入失败不影响主分析结果
+                    logger.warning(f"⚠️ 记忆反思写入失败(已忽略): {memory_err}")
 
             # 🔍 调试：检查decision的结构
             logger.info(f"🔍 [DEBUG] Decision类型: {type(decision)}")
