@@ -15,12 +15,141 @@ from app.constants.model_capabilities import (
 from app.core.unified_config import unified_config
 import logging
 import re
+import os
 
 logger = logging.getLogger(__name__)
 
 
 class ModelCapabilityService:
     """模型能力管理服务"""
+
+    @staticmethod
+    def _parse_int_env(value: Optional[str]) -> Optional[int]:
+        """解析环境变量中的能力等级（1-5）"""
+        if value is None:
+            return None
+        try:
+            level = int(str(value).strip())
+            if 1 <= level <= 5:
+                return level
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
+    def _parse_env_list(value: Optional[str]) -> List[str]:
+        """解析逗号分隔的环境变量列表，支持中英文逗号"""
+        if not value:
+            return []
+        return [
+            x.strip().lower()
+            for x in re.split(r"[,，]", str(value))
+            if x and x.strip()
+        ]
+
+    @classmethod
+    def _parse_feature_env(cls, value: Optional[str]) -> List[ModelFeature]:
+        """解析特性环境变量，兼容 thinking/tools 别名"""
+        aliases = {
+            "tool": "tool_calling",
+            "tools": "tool_calling",
+            "function_calling": "tool_calling",
+            "reason": "reasoning",
+            "thinking": "reasoning",
+        }
+        features: List[ModelFeature] = []
+        for raw in cls._parse_env_list(value):
+            normalized = aliases.get(raw, raw)
+            try:
+                feature = ModelFeature(normalized)
+            except ValueError:
+                logger.warning(f"⚠️ 环境变量包含未知模型特性: {raw}")
+                continue
+            if feature not in features:
+                features.append(feature)
+        return features
+
+    @classmethod
+    def _parse_role_env(cls, value: Optional[str]) -> List[ModelRole]:
+        """解析角色环境变量"""
+        aliases = {
+            "quick": "quick_analysis",
+            "fast": "quick_analysis",
+            "deep": "deep_analysis",
+        }
+        roles: List[ModelRole] = []
+        for raw in cls._parse_env_list(value):
+            normalized = aliases.get(raw, raw)
+            try:
+                role = ModelRole(normalized)
+            except ValueError:
+                logger.warning(f"⚠️ 环境变量包含未知模型角色: {raw}")
+                continue
+            if role not in roles:
+                roles.append(role)
+        return roles
+
+    def _get_env_model_override(self, model_name: str) -> Dict[str, Any]:
+        """
+        获取模型的环境变量能力覆盖配置。
+        支持 quick/deep 两套配置；当 quick/deep 指向同一模型时自动合并。
+        """
+        quick_model = (
+            os.getenv("TRADINGAGENTS_QUICK_MODEL")
+            or os.getenv("QUICK_ANALYSIS_MODEL")
+            or ""
+        ).strip()
+        deep_model = (
+            os.getenv("TRADINGAGENTS_DEEP_MODEL")
+            or os.getenv("DEEP_ANALYSIS_MODEL")
+            or ""
+        ).strip()
+
+        slots: List[str] = []
+        if quick_model and quick_model == model_name:
+            slots.append("QUICK")
+        if deep_model and deep_model == model_name:
+            slots.append("DEEP")
+
+        if not slots:
+            return {}
+
+        levels: List[int] = []
+        merged_features: List[ModelFeature] = []
+        merged_roles: List[ModelRole] = []
+
+        for slot in slots:
+            level = self._parse_int_env(os.getenv(f"TRADINGAGENTS_{slot}_MODEL_CAPABILITY_LEVEL"))
+            if level is not None:
+                levels.append(level)
+
+            for feature in self._parse_feature_env(os.getenv(f"TRADINGAGENTS_{slot}_MODEL_FEATURES")):
+                if feature not in merged_features:
+                    merged_features.append(feature)
+
+            for role in self._parse_role_env(os.getenv(f"TRADINGAGENTS_{slot}_MODEL_ROLES")):
+                if role not in merged_roles:
+                    merged_roles.append(role)
+
+        override: Dict[str, Any] = {}
+        if levels:
+            override["capability_level"] = max(levels)
+        if merged_features:
+            override["features"] = merged_features
+        if merged_roles:
+            override["suitable_roles"] = merged_roles
+        if override:
+            logger.info(f"🌱 环境变量能力覆盖生效: model={model_name}, slots={slots}, override={override}")
+        return override
+
+    @staticmethod
+    def _apply_model_override(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """将环境覆盖配置合并到基础模型配置"""
+        if not override:
+            return base
+        merged = dict(base)
+        merged.update(override)
+        return merged
 
     def _parse_aggregator_model_name(self, model_name: str) -> Tuple[Optional[str], str]:
         """
@@ -94,6 +223,11 @@ class ModelCapabilityService:
         Returns:
             能力等级 (1-5)
         """
+        # 0. 环境变量能力覆盖（最高优先级）
+        env_override = self._get_env_model_override(model_name)
+        if "capability_level" in env_override:
+            return env_override["capability_level"]
+
         # 1. 优先从数据库配置读取
         try:
             llm_configs = unified_config.get_llm_configs()
@@ -120,6 +254,8 @@ class ModelCapabilityService:
         Returns:
             模型配置字典
         """
+        env_override = self._get_env_model_override(model_name)
+
         # 1. 优先从 MongoDB 数据库配置读取（使用同步客户端）
         try:
             from pymongo import MongoClient
@@ -145,8 +281,8 @@ class ModelCapabilityService:
                 for config_dict in llm_configs:
                     if config_dict.get("model_name") == model_name:
                         logger.info(f"🔍 [MongoDB] 找到模型配置: {model_name}")
-                        # 🔧 将字符串列表转换为枚举列表
-                        features_str = config_dict.get('features', [])
+                        # 🔧 缺省按“支持工具调用 + 推理”处理（用户自定义模型常见场景）
+                        features_str = config_dict.get('features') or ["tool_calling", "reasoning"]
                         features_enum = []
                         for feature_str in features_str:
                             try:
@@ -155,8 +291,8 @@ class ModelCapabilityService:
                             except ValueError:
                                 logger.warning(f"⚠️ 未知的特性值: {feature_str}")
 
-                        # 🔧 将字符串列表转换为枚举列表
-                        roles_str = config_dict.get('suitable_roles', ["both"])
+                        # 🔧 缺省按 both 角色处理
+                        roles_str = config_dict.get('suitable_roles') or ["both"]
                         roles_enum = []
                         for role_str in roles_str:
                             try:
@@ -174,14 +310,16 @@ class ModelCapabilityService:
                         # 关闭连接
                         client.close()
 
-                        return {
+                        base_config = {
                             "model_name": config_dict.get("model_name"),
-                            "capability_level": config_dict.get('capability_level', 2),
+                            # 🔧 缺省按专业级能力(4)处理，满足“全面分析”最低门槛
+                            "capability_level": config_dict.get('capability_level') or 4,
                             "suitable_roles": roles_enum,
                             "features": features_enum,
-                            "recommended_depths": config_dict.get('recommended_depths', ["快速", "基础", "标准"]),
+                            "recommended_depths": config_dict.get('recommended_depths') or ["快速", "基础", "标准", "深度", "全面"],
                             "performance_metrics": config_dict.get('performance_metrics', None)
                         }
+                        return self._apply_model_override(base_config, env_override)
 
             # 关闭连接
             client.close()
@@ -191,7 +329,7 @@ class ModelCapabilityService:
 
         # 2. 从默认映射表读取（直接匹配）
         if model_name in DEFAULT_MODEL_CAPABILITIES:
-            return DEFAULT_MODEL_CAPABILITIES[model_name]
+            return self._apply_model_override(DEFAULT_MODEL_CAPABILITIES[model_name], env_override)
 
         # 3. 尝试聚合渠道模型映射
         provider, original_model = self._parse_aggregator_model_name(model_name)
@@ -201,18 +339,19 @@ class ModelCapabilityService:
                 config = DEFAULT_MODEL_CAPABILITIES[original_model].copy()
                 config["model_name"] = model_name  # 保持原始模型名
                 config["_mapped_from"] = original_model  # 记录映射来源
-                return config
+                return self._apply_model_override(config, env_override)
 
         # 4. 返回默认配置
         logger.warning(f"未找到模型 {model_name} 的配置，使用默认配置")
-        return {
+        fallback_config = {
             "model_name": model_name,
-            "capability_level": 2,
+            "capability_level": 4,
             "suitable_roles": [ModelRole.BOTH],
-            "features": [ModelFeature.TOOL_CALLING],
-            "recommended_depths": ["快速", "基础", "标准"],
+            "features": [ModelFeature.TOOL_CALLING, ModelFeature.REASONING],
+            "recommended_depths": ["快速", "基础", "标准", "深度", "全面"],
             "performance_metrics": {"speed": 3, "cost": 3, "quality": 3}
         }
+        return self._apply_model_override(fallback_config, env_override)
     
     def validate_model_pair(
         self,
@@ -427,4 +566,3 @@ def get_model_capability_service() -> ModelCapabilityService:
     if _model_capability_service is None:
         _model_capability_service = ModelCapabilityService()
     return _model_capability_service
-

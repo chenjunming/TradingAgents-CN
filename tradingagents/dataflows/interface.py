@@ -38,7 +38,13 @@ except ImportError as e:
 # 导入AKShare港股工具
 # 注意：港股功能在 providers/hk/ 目录中
 try:
-    from .providers.hk.improved_hk import get_hk_stock_data_akshare, get_hk_stock_info_akshare
+    from .providers.hk.improved_hk import (
+        get_hk_stock_data_akshare,
+        get_hk_stock_info_akshare,
+        get_hk_stock_data_longport,
+        get_hk_stock_info_longport,
+        get_stock_data_longport_unified,
+    )
     AKSHARE_HK_AVAILABLE = True
 except (ImportError, AttributeError) as e:
     logger.warning(f"⚠️ AKShare港股工具不可用: {e}")
@@ -48,9 +54,44 @@ except (ImportError, AttributeError) as e:
         return None
     def get_hk_stock_info_akshare(*args, **kwargs):
         return None
+    def get_hk_stock_data_longport(*args, **kwargs):
+        return None
+    def get_hk_stock_info_longport(*args, **kwargs):
+        return None
+    def get_stock_data_longport_unified(*args, **kwargs):
+        return None
 
 
 # ==================== 数据源配置读取 ====================
+
+def _has_longport_credentials() -> bool:
+    """判断是否已配置可用的 LongPort 凭证（环境变量优先，数据库兜底）。"""
+    app_key = os.getenv("LONGPORT_APP_KEY", "").strip()
+    app_secret = os.getenv("LONGPORT_APP_SECRET", "").strip()
+    access_token = os.getenv("LONGPORT_ACCESS_TOKEN", "").strip()
+    if app_key and app_secret and access_token:
+        return True
+
+    try:
+        from app.core.database import get_mongo_db_sync
+        db = get_mongo_db_sync()
+        config_data = db.system_configs.find_one({"is_active": True}, sort=[("version", -1)])
+        if not config_data:
+            return False
+        for ds in config_data.get("data_source_configs", []):
+            ds_type = str(ds.get("type", "")).lower()
+            ds_name = str(ds.get("name", "")).lower()
+            if ds_type != "longport" and ds_name != "longport":
+                continue
+            cfg = ds.get("config_params", {}) or {}
+            ak = (ds.get("api_key") or "").strip()
+            sk = (ds.get("api_secret") or "").strip()
+            tk = (cfg.get("access_token") or "").strip()
+            if ak and sk and tk:
+                return True
+    except Exception:
+        return False
+    return False
 
 def _get_enabled_hk_data_sources() -> list:
     """
@@ -88,7 +129,7 @@ def _get_enabled_hk_data_sources() -> list:
 
                 # 映射数据源类型
                 ds_type = ds.get('type', '').lower()
-                if ds_type in ['akshare', 'yfinance', 'finnhub']:
+                if ds_type in ['longport', 'akshare', 'yfinance', 'finnhub']:
                     enabled_sources.append({
                         'type': ds_type,
                         'priority': ds.get('priority', 0)
@@ -98,6 +139,9 @@ def _get_enabled_hk_data_sources() -> list:
             enabled_sources.sort(key=lambda x: x['priority'], reverse=True)
 
             result = [s['type'] for s in enabled_sources]
+            if _has_longport_credentials() and 'longport' not in result:
+                result = ['longport'] + result
+                logger.info("✅ [港股数据源] 检测到LongPort凭证，自动提升到首位")
             if result:
                 logger.info(f"✅ [港股数据源] 从数据库读取: {result}")
                 return result
@@ -109,6 +153,8 @@ def _get_enabled_hk_data_sources() -> list:
         logger.warning(f"⚠️ [港股数据源] 从数据库读取失败: {e}，使用默认顺序")
 
     # 回退到默认顺序
+    if _has_longport_credentials():
+        return ['longport', 'akshare', 'yfinance']
     return ['akshare', 'yfinance']
 
 
@@ -148,7 +194,7 @@ def _get_enabled_us_data_sources() -> list:
 
                 # 映射数据源类型
                 ds_type = ds.get('type', '').lower()
-                if ds_type in ['yfinance', 'finnhub']:
+                if ds_type in ['longport', 'yfinance', 'finnhub']:
                     enabled_sources.append({
                         'type': ds_type,
                         'priority': ds.get('priority', 0)
@@ -158,6 +204,9 @@ def _get_enabled_us_data_sources() -> list:
             enabled_sources.sort(key=lambda x: x['priority'], reverse=True)
 
             result = [s['type'] for s in enabled_sources]
+            if _has_longport_credentials() and 'longport' not in result:
+                result = ['longport'] + result
+                logger.info("✅ [美股数据源] 检测到LongPort凭证，自动提升到首位")
             if result:
                 logger.info(f"✅ [美股数据源] 从数据库读取: {result}")
                 return result
@@ -169,6 +218,8 @@ def _get_enabled_us_data_sources() -> list:
         logger.warning(f"⚠️ [美股数据源] 从数据库读取失败: {e}，使用默认顺序")
 
     # 回退到默认顺序
+    if _has_longport_credentials():
+        return ['longport', 'yfinance', 'finnhub']
     return ['yfinance', 'finnhub']
 
 # 尝试导入yfinance相关模块，如果失败则跳过
@@ -1747,6 +1798,16 @@ def get_china_stock_data_unified(
     start_time = time.time()
 
     try:
+        # 优先尝试 LongPort（若可用），失败回退原有中国多数据源链路
+        try:
+            lp_result = get_stock_data_longport_unified(ticker, start_date, end_date)
+            if lp_result and "❌" not in lp_result:
+                logger.info(f"✅ [统一接口] LongPort优先获取成功: {ticker}")
+                return lp_result
+            logger.warning(f"⚠️ [统一接口] LongPort返回异常结果，回退中国数据源链路: {ticker}")
+        except Exception as lp_e:
+            logger.warning(f"⚠️ [统一接口] LongPort优先获取失败，回退中国数据源链路: {lp_e}")
+
         from .data_source_manager import get_china_stock_data_unified
 
         result = get_china_stock_data_unified(ticker, start_date, end_date)
@@ -1961,7 +2022,19 @@ def get_hk_stock_data_unified(symbol: str, start_date: str = None, end_date: str
 
         # 按优先级尝试各个数据源
         for source in enabled_sources:
-            if source == 'akshare' and AKSHARE_HK_AVAILABLE:
+            if source == 'longport':
+                try:
+                    logger.info(f"🔄 使用LongPort获取港股数据: {symbol}")
+                    result = get_hk_stock_data_longport(symbol, start_date, end_date)
+                    if result and "❌" not in result:
+                        logger.info(f"✅ LongPort港股数据获取成功: {symbol}")
+                        return result
+                    else:
+                        logger.warning(f"⚠️ LongPort返回错误结果，尝试下一个数据源")
+                except Exception as e:
+                    logger.error(f"⚠️ LongPort港股数据获取失败: {e}，尝试下一个数据源")
+
+            elif source == 'akshare' and AKSHARE_HK_AVAILABLE:
                 try:
                     logger.info(f"🔄 使用AKShare获取港股数据: {symbol}")
                     result = get_hk_stock_data_akshare(symbol, start_date, end_date)
@@ -2031,7 +2104,19 @@ def get_hk_stock_info_unified(symbol: str) -> Dict:
 
         # 按优先级尝试各个数据源
         for source in enabled_sources:
-            if source == 'akshare' and AKSHARE_HK_AVAILABLE:
+            if source == 'longport':
+                try:
+                    logger.info(f"🔄 使用LongPort获取港股信息: {symbol}")
+                    result = get_hk_stock_info_longport(symbol)
+                    if result and 'error' not in result:
+                        logger.info(f"✅ LongPort成功获取港股信息: {symbol} -> {result.get('name', 'N/A')}")
+                        return result
+                    else:
+                        logger.warning(f"⚠️ LongPort返回默认/错误信息，尝试下一个数据源")
+                except Exception as e:
+                    logger.error(f"⚠️ LongPort港股信息获取失败: {e}，尝试下一个数据源")
+
+            elif source == 'akshare' and AKSHARE_HK_AVAILABLE:
                 try:
                     logger.info(f"🔄 使用AKShare获取港股信息: {symbol}")
                     result = get_hk_stock_info_akshare(symbol)
@@ -2101,15 +2186,56 @@ def get_stock_data_by_market(symbol: str, start_date: str = None, end_date: str 
             # 港股
             return get_hk_stock_data_unified(symbol, start_date, end_date)
         else:
-            # 美股或其他
-            # 导入美股数据提供器（支持新旧路径）
+            # 美股或其他：按配置优先级尝试（支持 longport）
+            from tradingagents.utils.dataflow_utils import get_trading_date_range
+            from app.core.config import get_settings
+
+            # 与A/HK保持一致：自动回溯，避免单日无K线导致误回退
             try:
-                from .providers.us import OptimizedUSDataProvider
-                provider = OptimizedUSDataProvider()
-                return provider.get_stock_data(symbol, start_date, end_date)
-            except ImportError:
+                settings = get_settings()
+                lookback_days = settings.MARKET_ANALYST_LOOKBACK_DAYS
+                logger.info(f"📅 [美股配置验证] MARKET_ANALYST_LOOKBACK_DAYS: {lookback_days}天")
+            except Exception:
+                lookback_days = 365
+            us_start_date, us_end_date = get_trading_date_range(end_date, lookback_days=lookback_days)
+
+            logger.info(f"📅 [美股智能日期] 原始输入: {start_date} 至 {end_date}")
+            logger.info(f"📅 [美股智能日期] 回溯天数: {lookback_days}天")
+            logger.info(f"📅 [美股智能日期] 计算结果: {us_start_date} 至 {us_end_date}")
+            logger.info(f"📅 [美股智能日期] 实际天数: {(datetime.strptime(us_end_date, '%Y-%m-%d') - datetime.strptime(us_start_date, '%Y-%m-%d')).days}天")
+
+            enabled_sources = _get_enabled_us_data_sources()
+            for source in enabled_sources:
+                if source == 'longport':
+                    try:
+                        logger.info(f"🔄 使用LongPort获取美股数据: {symbol}")
+                        result = get_stock_data_longport_unified(symbol, us_start_date, us_end_date)
+                        if result and "❌" not in result:
+                            logger.info(f"✅ LongPort美股数据获取成功: {symbol}")
+                            return result
+                    except Exception as e:
+                        logger.warning(f"⚠️ LongPort美股数据获取失败: {e}")
+                elif source in ('yfinance', 'finnhub'):
+                    try:
+                        from .providers.us import OptimizedUSDataProvider
+                        provider = OptimizedUSDataProvider()
+                        result = provider.get_stock_data(symbol, us_start_date, us_end_date)
+                        if result and "❌" not in result:
+                            return result
+                    except ImportError:
+                        from tradingagents.dataflows.providers.us.optimized import get_us_stock_data_cached
+                        result = get_us_stock_data_cached(symbol, us_start_date, us_end_date)
+                        if result and "❌" not in result:
+                            return result
+                    except Exception as e:
+                        logger.warning(f"⚠️ 美股数据源 {source} 获取失败: {e}")
+
+            # 最终兜底
+            try:
                 from tradingagents.dataflows.providers.us.optimized import get_us_stock_data_cached
-                return get_us_stock_data_cached(symbol, start_date, end_date)
+                return get_us_stock_data_cached(symbol, us_start_date, us_end_date)
+            except Exception as e:
+                return f"❌ 获取{symbol}数据失败: {e}"
 
     except Exception as e:
         logger.error(f"❌ 获取股票数据失败: {e}")

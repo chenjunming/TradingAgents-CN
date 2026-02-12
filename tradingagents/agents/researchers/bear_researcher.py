@@ -8,6 +8,7 @@ logger = get_logger("default")
 from tradingagents.agents.utils.prompt_contract import (
     get_anti_repetition_rules,
     get_concise_contract,
+    get_research_balance_rules,
     get_output_schema,
 )
 
@@ -95,12 +96,14 @@ def create_bear_researcher(llm, memory):
         concise_contract = get_concise_contract("bear_researcher", expression_profile)
         output_schema = get_output_schema("bear_researcher")
         anti_repetition_rules = get_anti_repetition_rules()
+        research_balance_rules = get_research_balance_rules()
 
         prompt = f"""你是看跌研究员，目标是论证不投资 {company_name}（{ticker}）的理由。
 
 {concise_contract}
 角色输出模板：{output_schema}
 {anti_repetition_rules}
+{research_balance_rules}
 
 约束：
 1. 价格与估值统一使用 {currency}（{currency_symbol}）。

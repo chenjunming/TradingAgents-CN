@@ -484,6 +484,585 @@ def get_hk_financial_indicators(symbol: str) -> Dict[str, Any]:
     return provider.get_financial_indicators(symbol)
 
 
+def _get_hk_realtime_quote_akshare_no_cache(symbol: str) -> Dict[str, Any]:
+    """
+    从 AKShare 直接读取港股实时快照（不使用任何本地缓存）。
+
+    Args:
+        symbol: 港股代码
+
+    Returns:
+        Dict: 实时行情字段，失败返回空字典
+    """
+    try:
+        import akshare as ak
+
+        provider = get_improved_hk_provider()
+        normalized_symbol = provider._normalize_hk_symbol(symbol)
+
+        # 直接拉取实时快照，不走本模块缓存
+        df = ak.stock_hk_spot()
+        if df is None or df.empty:
+            return {}
+
+        matched = df[df['代码'] == normalized_symbol]
+        if matched.empty:
+            return {}
+
+        row = matched.iloc[0]
+
+        def safe_float(value):
+            try:
+                if value is None or value == '' or (isinstance(value, float) and value != value):
+                    return None
+                return float(value)
+            except Exception:
+                return None
+
+        def safe_int(value):
+            try:
+                if value is None or value == '' or (isinstance(value, float) and value != value):
+                    return None
+                return int(value)
+            except Exception:
+                return None
+
+        return {
+            'price': safe_float(row.get('最新价')),
+            'open': safe_float(row.get('今开')),
+            'high': safe_float(row.get('最高')),
+            'low': safe_float(row.get('最低')),
+            'pre_close': safe_float(row.get('昨收')),
+            'volume': safe_int(row.get('成交量')),
+            'change_percent': safe_float(row.get('涨跌幅')),
+            'source': 'akshare_spot_no_cache',
+            'snapshot_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+    except Exception as e:
+        logger.warning(f"⚠️ [AKShare-实时无缓存] 获取失败: {symbol} - {e}")
+        return {}
+
+
+def _read_longport_credentials() -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """读取 LongPort 凭证：环境变量优先，数据库配置兜底。"""
+    app_key = os.getenv("LONGPORT_APP_KEY")
+    app_secret = os.getenv("LONGPORT_APP_SECRET")
+    access_token = os.getenv("LONGPORT_ACCESS_TOKEN")
+
+    if app_key and app_secret and access_token:
+        return app_key, app_secret, access_token
+
+    try:
+        from app.core.database import get_mongo_db_sync
+        db = get_mongo_db_sync()
+        config_data = db.system_configs.find_one({"is_active": True}, sort=[("version", -1)])
+        if config_data:
+            for ds in config_data.get("data_source_configs", []):
+                ds_type = str(ds.get("type", "")).lower()
+                ds_name = str(ds.get("name", "")).lower()
+                if ds_type != "longport" and ds_name != "longport":
+                    continue
+                cfg = ds.get("config_params", {}) or {}
+                app_key = app_key or ds.get("api_key")
+                app_secret = app_secret or ds.get("api_secret")
+                access_token = access_token or cfg.get("access_token")
+                break
+    except Exception as e:
+        logger.debug(f"📊 [LongPort] 读取数据库配置失败: {e}")
+
+    return app_key, app_secret, access_token
+
+
+def _to_longport_hk_symbol(symbol: str) -> str:
+    provider = get_improved_hk_provider()
+    return f"{provider._normalize_hk_symbol(symbol)}.HK"
+
+
+def get_hk_stock_info_longport(symbol: str) -> Dict[str, Any]:
+    """
+    使用 LongPort 获取港股基础信息与实时价格。
+    """
+    try:
+        from longport.openapi import Config, QuoteContext
+    except Exception as e:
+        return {
+            'symbol': symbol,
+            'name': f'港股{symbol}',
+            'currency': 'HKD',
+            'exchange': 'HKG',
+            'source': 'longport',
+            'error': f'LongPort SDK不可用: {e}',
+        }
+
+    app_key, app_secret, access_token = _read_longport_credentials()
+    if not (app_key and app_secret and access_token):
+        return {
+            'symbol': symbol,
+            'name': f'港股{symbol}',
+            'currency': 'HKD',
+            'exchange': 'HKG',
+            'source': 'longport',
+            'error': 'LongPort凭证未配置',
+        }
+
+    os.environ["LONGPORT_APP_KEY"] = app_key
+    os.environ["LONGPORT_APP_SECRET"] = app_secret
+    os.environ["LONGPORT_ACCESS_TOKEN"] = access_token
+
+    lp_symbol = _to_longport_hk_symbol(symbol)
+    cfg = Config.from_env()
+    ctx = QuoteContext(cfg)
+
+    def safe_float(value):
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    static_item = None
+    quote_item = None
+
+    try:
+        static_list = ctx.static_info([lp_symbol]) or []
+        if static_list:
+            static_item = static_list[0]
+    except Exception:
+        pass
+
+    try:
+        quote_list = ctx.quote([lp_symbol]) or []
+        if quote_list:
+            quote_item = quote_list[0]
+    except Exception:
+        pass
+
+    name = None
+    if static_item is not None:
+        name = (
+            getattr(static_item, "name_hk", None)
+            or getattr(static_item, "name_cn", None)
+            or getattr(static_item, "name_en", None)
+        )
+
+    return {
+        'symbol': symbol,
+        'name': name or f'港股{lp_symbol}',
+        'price': safe_float(getattr(quote_item, "last_done", None)) if quote_item else None,
+        'open': safe_float(getattr(quote_item, "open", None)) if quote_item else None,
+        'high': safe_float(getattr(quote_item, "high", None)) if quote_item else None,
+        'low': safe_float(getattr(quote_item, "low", None)) if quote_item else None,
+        'volume': safe_float(getattr(quote_item, "volume", None)) if quote_item else None,
+        'change_percent': (
+            ((safe_float(getattr(quote_item, "last_done", None)) / safe_float(getattr(quote_item, "prev_close", None)) - 1) * 100)
+            if quote_item and safe_float(getattr(quote_item, "last_done", None)) is not None and safe_float(getattr(quote_item, "prev_close", None)) not in (None, 0)
+            else None
+        ),
+        'currency': 'HKD',
+        'exchange': 'HKG',
+        'market': '港股',
+        'source': 'longport',
+    }
+
+
+def get_hk_stock_data_longport(symbol: str, start_date: str = None, end_date: str = None) -> str:
+    """
+    使用 LongPort 获取港股行情（实时价 + 日线K线），并计算技术指标。
+    """
+    try:
+        from longport.openapi import Config, QuoteContext, Period, AdjustType
+    except Exception as e:
+        return f"❌ LongPort SDK不可用: {e}"
+
+    app_key, app_secret, access_token = _read_longport_credentials()
+    if not (app_key and app_secret and access_token):
+        return "❌ LongPort凭证未配置（LONGPORT_APP_KEY/LONGPORT_APP_SECRET/LONGPORT_ACCESS_TOKEN）"
+
+    os.environ["LONGPORT_APP_KEY"] = app_key
+    os.environ["LONGPORT_APP_SECRET"] = app_secret
+    os.environ["LONGPORT_ACCESS_TOKEN"] = access_token
+
+    try:
+        lp_symbol = _to_longport_hk_symbol(symbol)
+
+        if not end_date:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if not start_date:
+            start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+        cfg = Config.from_env()
+        ctx = QuoteContext(cfg)
+
+        # 1) 实时行情
+        quote_list = ctx.quote([lp_symbol]) or []
+        quote_item = quote_list[0] if quote_list else None
+
+        # 2) 历史日线
+        start_d = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_d = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+        candles = ctx.history_candlesticks_by_date(
+            lp_symbol,
+            Period.Day,
+            AdjustType.ForwardAdjust,
+            start=start_d,
+            end=end_d,
+        ) or []
+
+        if not candles:
+            return f"❌ LongPort未返回{symbol}在指定区间的日线数据"
+
+        def safe_float(value):
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except Exception:
+                return None
+
+        def to_dt(value):
+            try:
+                return pd.to_datetime(value)
+            except Exception:
+                try:
+                    iv = int(value)
+                    return pd.to_datetime(iv, unit="s")
+                except Exception:
+                    return pd.NaT
+
+        rows = []
+        for c in candles:
+            rows.append({
+                'date': to_dt(getattr(c, 'timestamp', None)),
+                'open': safe_float(getattr(c, 'open', None)),
+                'high': safe_float(getattr(c, 'high', None)),
+                'low': safe_float(getattr(c, 'low', None)),
+                'close': safe_float(getattr(c, 'close', None)),
+                'volume': safe_float(getattr(c, 'volume', None)),
+                'turnover': safe_float(getattr(c, 'turnover', None)),
+            })
+
+        df = pd.DataFrame(rows).dropna(subset=['date', 'close']).sort_values('date').reset_index(drop=True)
+        if df.empty:
+            return f"❌ LongPort返回的{symbol}日线数据为空"
+
+        df['pre_close'] = df['close'].shift(1)
+        df['change'] = df['close'] - df['pre_close']
+        df['pct_change'] = (df['change'] / df['pre_close'] * 100).round(2)
+
+        from tradingagents.tools.analysis.indicators import add_all_indicators
+        df = add_all_indicators(df, close_col='close', high_col='high', low_col='low')
+
+        latest = df.iloc[-1]
+
+        realtime_price = safe_float(getattr(quote_item, 'last_done', None)) if quote_item else None
+        realtime_pre_close = safe_float(getattr(quote_item, 'prev_close', None)) if quote_item else None
+        realtime_open = safe_float(getattr(quote_item, 'open', None)) if quote_item else None
+        realtime_high = safe_float(getattr(quote_item, 'high', None)) if quote_item else None
+        realtime_low = safe_float(getattr(quote_item, 'low', None)) if quote_item else None
+        realtime_volume = safe_float(getattr(quote_item, 'volume', None)) if quote_item else None
+        snapshot_ts = str(getattr(quote_item, 'timestamp', 'N/A')) if quote_item else "N/A"
+
+        current_price = realtime_price if realtime_price is not None else float(latest['close'])
+        display_pre_close = realtime_pre_close if realtime_pre_close is not None else (float(latest['pre_close']) if pd.notna(latest['pre_close']) else None)
+        display_change = (current_price - display_pre_close) if (display_pre_close not in (None, 0)) else (float(latest['change']) if pd.notna(latest['change']) else None)
+        display_pct_change = ((display_change / display_pre_close) * 100) if (display_pre_close not in (None, 0) and display_change is not None) else (float(latest['pct_change']) if pd.notna(latest['pct_change']) else None)
+
+        display_open = realtime_open if realtime_open is not None else float(latest['open'])
+        display_high = realtime_high if realtime_high is not None else float(latest['high'])
+        display_low = realtime_low if realtime_low is not None else float(latest['low'])
+        display_volume = realtime_volume if realtime_volume is not None else float(latest['volume'])
+
+        # 静态信息（用于名称/EPS/BPS）
+        static_name = None
+        eps_ttm = None
+        bps = None
+        try:
+            static_list = ctx.static_info([lp_symbol]) or []
+            if static_list:
+                s = static_list[0]
+                static_name = (
+                    getattr(s, "name_hk", None)
+                    or getattr(s, "name_cn", None)
+                    or getattr(s, "name_en", None)
+                )
+                eps_ttm = safe_float(getattr(s, "eps_ttm", None))
+                bps = safe_float(getattr(s, "bps", None))
+        except Exception:
+            pass
+
+        pe_ratio = (current_price / eps_ttm) if (eps_ttm and eps_ttm > 0) else None
+        pb_ratio = (current_price / bps) if (bps and bps > 0) else None
+
+        def fmt_hk(v):
+            return f"HK${float(v):.2f}" if v is not None else "N/A"
+
+        def fmt_pct(v):
+            return f"{float(v):.2f}%" if v is not None else "N/A"
+
+        result = f"""## 港股历史数据 ({symbol})
+**数据源**: LongPort OpenAPI
+**LongPort代码**: {lp_symbol}
+**日期范围**: {start_date} ~ {end_date}
+**数据条数**: {len(df)} 条
+
+### 最新价格信息
+- 价格来源: LongPort 实时行情
+- 实时快照时间: {snapshot_ts}
+- 最新价: {fmt_hk(current_price)}
+- 昨收: {fmt_hk(display_pre_close)}
+- 涨跌额: {fmt_hk(display_change)}
+- 涨跌幅: {fmt_pct(display_pct_change)}
+- 今开: {fmt_hk(display_open)}
+- 最高: {fmt_hk(display_high)}
+- 最低: {fmt_hk(display_low)}
+- 成交量: {int(display_volume):,d}
+
+### 技术指标（最新值）
+**移动平均线**:
+- MA5: HK${latest['ma5']:.2f}
+- MA10: HK${latest['ma10']:.2f}
+- MA20: HK${latest['ma20']:.2f}
+- MA60: HK${latest['ma60']:.2f}
+
+**MACD指标**:
+- DIF: {latest['macd_dif']:.2f}
+- DEA: {latest['macd_dea']:.2f}
+- MACD: {latest['macd']:.2f}
+
+**RSI指标**:
+- RSI(14): {latest['rsi']:.2f}
+
+**布林带**:
+- 上轨: HK${latest['boll_upper']:.2f}
+- 中轨: HK${latest['boll_mid']:.2f}
+- 下轨: HK${latest['boll_lower']:.2f}
+
+### 估值快照（LongPort静态信息）
+- 公司名称: {static_name or f'港股{lp_symbol}'}
+- EPS_TTM: {eps_ttm if eps_ttm is not None else 'N/A'}
+- BPS: {bps if bps is not None else 'N/A'}
+- PE(估算): {f'{pe_ratio:.2f}' if pe_ratio is not None else 'N/A'}
+- PB(估算): {f'{pb_ratio:.2f}' if pb_ratio is not None else 'N/A'}
+
+### 最近10个交易日价格
+{df[['date', 'open', 'high', 'low', 'close', 'pre_close', 'change', 'pct_change', 'volume']].tail(10).to_string(index=False)}
+"""
+        logger.info(f"✅ [LongPort] 港股数据获取成功: {symbol} ({len(df)}条)")
+        return result
+    except Exception as e:
+        logger.error(f"❌ [LongPort] 港股数据获取失败: {symbol} - {e}")
+        return f"❌ LongPort获取港股{symbol}数据失败: {e}"
+
+
+def _to_longport_symbol(symbol: str) -> str:
+    """将 A/HK/US 代码转换为 LongPort 格式。"""
+    from tradingagents.utils.stock_utils import StockUtils, StockMarket
+
+    s = str(symbol or "").strip().upper()
+    market = StockUtils.identify_stock_market(s)
+
+    if market == StockMarket.HONG_KONG:
+        return _to_longport_hk_symbol(s)
+
+    if market == StockMarket.CHINA_A:
+        code = "".join(ch for ch in s if ch.isdigit()).zfill(6)
+        if code.startswith(("60", "68", "90")):
+            return f"{code}.SH"
+        return f"{code}.SZ"
+
+    if market == StockMarket.US:
+        base = s.replace(".US", "")
+        return f"{base}.US"
+
+    return s
+
+
+def get_stock_data_longport_unified(symbol: str, start_date: str = None, end_date: str = None) -> str:
+    """
+    通用 LongPort 三市场行情接口（A/HK/US）：
+    - 实时行情：quote
+    - 历史日线：history_candlesticks_by_date
+    - 技术指标：MA/MACD/RSI/BOLL
+    """
+    try:
+        from longport.openapi import Config, QuoteContext, Period, AdjustType
+    except Exception as e:
+        return f"❌ LongPort SDK不可用: {e}"
+
+    app_key, app_secret, access_token = _read_longport_credentials()
+    if not (app_key and app_secret and access_token):
+        return "❌ LongPort凭证未配置（LONGPORT_APP_KEY/LONGPORT_APP_SECRET/LONGPORT_ACCESS_TOKEN）"
+
+    os.environ["LONGPORT_APP_KEY"] = app_key
+    os.environ["LONGPORT_APP_SECRET"] = app_secret
+    os.environ["LONGPORT_ACCESS_TOKEN"] = access_token
+
+    try:
+        from tradingagents.utils.stock_utils import StockUtils, StockMarket
+
+        raw_symbol = str(symbol or "").strip()
+        lp_symbol = _to_longport_symbol(raw_symbol)
+        market = StockUtils.identify_stock_market(raw_symbol)
+
+        if not end_date:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        if not start_date:
+            start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+        cfg = Config.from_env()
+        ctx = QuoteContext(cfg)
+
+        def safe_float(value):
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except Exception:
+                return None
+
+        def to_dt(value):
+            try:
+                return pd.to_datetime(value)
+            except Exception:
+                try:
+                    return pd.to_datetime(int(value), unit="s")
+                except Exception:
+                    return pd.NaT
+
+        # 实时
+        quote_list = ctx.quote([lp_symbol]) or []
+        quote_item = quote_list[0] if quote_list else None
+
+        # 日线
+        start_d = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_d = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+        try:
+            candles = ctx.history_candlesticks_by_date(
+                lp_symbol,
+                Period.Day,
+                AdjustType.ForwardAdjust,
+                start=start_d,
+                end=end_d,
+            ) or []
+        except Exception:
+            candles = ctx.history_candlesticks_by_date(
+                lp_symbol,
+                Period.Day,
+                AdjustType.NoAdjust,
+                start=start_d,
+                end=end_d,
+            ) or []
+
+        if not candles:
+            return f"❌ LongPort未返回{raw_symbol}在指定区间的日线数据"
+
+        rows = []
+        for c in candles:
+            rows.append({
+                "date": to_dt(getattr(c, "timestamp", None)),
+                "open": safe_float(getattr(c, "open", None)),
+                "high": safe_float(getattr(c, "high", None)),
+                "low": safe_float(getattr(c, "low", None)),
+                "close": safe_float(getattr(c, "close", None)),
+                "volume": safe_float(getattr(c, "volume", None)),
+                "turnover": safe_float(getattr(c, "turnover", None)),
+            })
+
+        df = pd.DataFrame(rows).dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+        if df.empty:
+            return f"❌ LongPort返回的{raw_symbol}日线数据为空"
+
+        df["pre_close"] = df["close"].shift(1)
+        df["change"] = df["close"] - df["pre_close"]
+        df["pct_change"] = (df["change"] / df["pre_close"] * 100).round(2)
+
+        from tradingagents.tools.analysis.indicators import add_all_indicators
+        df = add_all_indicators(df, close_col="close", high_col="high", low_col="low")
+        latest = df.iloc[-1]
+
+        realtime_price = safe_float(getattr(quote_item, "last_done", None)) if quote_item else None
+        realtime_pre_close = safe_float(getattr(quote_item, "prev_close", None)) if quote_item else None
+        realtime_open = safe_float(getattr(quote_item, "open", None)) if quote_item else None
+        realtime_high = safe_float(getattr(quote_item, "high", None)) if quote_item else None
+        realtime_low = safe_float(getattr(quote_item, "low", None)) if quote_item else None
+        realtime_volume = safe_float(getattr(quote_item, "volume", None)) if quote_item else None
+        snapshot_ts = str(getattr(quote_item, "timestamp", "N/A")) if quote_item else "N/A"
+
+        current_price = realtime_price if realtime_price is not None else float(latest["close"])
+        display_pre_close = realtime_pre_close if realtime_pre_close is not None else (float(latest["pre_close"]) if pd.notna(latest["pre_close"]) else None)
+        display_change = (current_price - display_pre_close) if (display_pre_close not in (None, 0)) else (float(latest["change"]) if pd.notna(latest["change"]) else None)
+        display_pct_change = ((display_change / display_pre_close) * 100) if (display_pre_close not in (None, 0) and display_change is not None) else (float(latest["pct_change"]) if pd.notna(latest["pct_change"]) else None)
+        display_open = realtime_open if realtime_open is not None else float(latest["open"])
+        display_high = realtime_high if realtime_high is not None else float(latest["high"])
+        display_low = realtime_low if realtime_low is not None else float(latest["low"])
+        display_volume = realtime_volume if realtime_volume is not None else float(latest["volume"])
+
+        market_label = "未知市场"
+        currency_symbol = ""
+        if market == StockMarket.CHINA_A:
+            market_label = "A股"
+            currency_symbol = "¥"
+        elif market == StockMarket.HONG_KONG:
+            market_label = "港股"
+            currency_symbol = "HK$"
+        elif market == StockMarket.US:
+            market_label = "美股"
+            currency_symbol = "$"
+
+        def fmt_price(v):
+            return f"{currency_symbol}{float(v):.2f}" if v is not None else "N/A"
+
+        def fmt_pct(v):
+            return f"{float(v):.2f}%" if v is not None else "N/A"
+
+        result = f"""## {market_label}历史数据 ({raw_symbol})
+**数据源**: LongPort OpenAPI
+**LongPort代码**: {lp_symbol}
+**日期范围**: {start_date} ~ {end_date}
+**数据条数**: {len(df)} 条
+
+### 最新价格信息
+- 价格来源: LongPort 实时行情
+- 实时快照时间: {snapshot_ts}
+- 最新价: {fmt_price(current_price)}
+- 昨收: {fmt_price(display_pre_close)}
+- 涨跌额: {fmt_price(display_change)}
+- 涨跌幅: {fmt_pct(display_pct_change)}
+- 今开: {fmt_price(display_open)}
+- 最高: {fmt_price(display_high)}
+- 最低: {fmt_price(display_low)}
+- 成交量: {int(display_volume):,d}
+
+### 技术指标（最新值）
+**移动平均线**:
+- MA5: {currency_symbol}{latest['ma5']:.2f}
+- MA10: {currency_symbol}{latest['ma10']:.2f}
+- MA20: {currency_symbol}{latest['ma20']:.2f}
+- MA60: {currency_symbol}{latest['ma60']:.2f}
+
+**MACD指标**:
+- DIF: {latest['macd_dif']:.2f}
+- DEA: {latest['macd_dea']:.2f}
+- MACD: {latest['macd']:.2f}
+
+**RSI指标**:
+- RSI(14): {latest['rsi']:.2f}
+
+**布林带**:
+- 上轨: {currency_symbol}{latest['boll_upper']:.2f}
+- 中轨: {currency_symbol}{latest['boll_mid']:.2f}
+- 下轨: {currency_symbol}{latest['boll_lower']:.2f}
+"""
+        logger.info(f"✅ [LongPort-统一] {market_label}数据获取成功: {raw_symbol} ({len(df)}条)")
+        return result
+    except Exception as e:
+        logger.error(f"❌ [LongPort-统一] 数据获取失败: {symbol} - {e}")
+        return f"❌ LongPort获取{symbol}数据失败: {e}"
+
+
 # 兼容性函数：为了兼容旧的 akshare_utils 导入
 def get_hk_stock_data_akshare(symbol: str, start_date: str = None, end_date: str = None):
     """
@@ -546,7 +1125,56 @@ def get_hk_stock_data_akshare(symbol: str, start_date: str = None, end_date: str
 
         # 格式化输出（包含价格数据和技术指标）
         latest = df.iloc[-1]
-        current_price = latest['close']
+        daily_close = float(latest['close'])
+
+        # 当前价格/涨跌幅：强制直连实时快照（不使用缓存）
+        realtime_quote = _get_hk_realtime_quote_akshare_no_cache(symbol)
+        use_realtime = bool(realtime_quote and realtime_quote.get('price') is not None)
+
+        current_price = float(realtime_quote['price']) if use_realtime else daily_close
+        display_open = float(realtime_quote.get('open')) if use_realtime and realtime_quote.get('open') is not None else float(latest['open'])
+        display_high = float(realtime_quote.get('high')) if use_realtime and realtime_quote.get('high') is not None else float(latest['high'])
+        display_low = float(realtime_quote.get('low')) if use_realtime and realtime_quote.get('low') is not None else float(latest['low'])
+        display_volume = int(realtime_quote.get('volume')) if use_realtime and realtime_quote.get('volume') is not None else int(latest['volume'])
+
+        if use_realtime and realtime_quote.get('pre_close') is not None:
+            display_pre_close = float(realtime_quote['pre_close'])
+            display_change = current_price - display_pre_close
+            display_pct_change = (display_change / display_pre_close * 100) if display_pre_close else None
+        else:
+            display_pre_close = float(latest['pre_close']) if pd.notna(latest['pre_close']) else None
+            display_change = float(latest['change']) if pd.notna(latest['change']) else None
+            display_pct_change = float(latest['pct_change']) if pd.notna(latest['pct_change']) else None
+
+        if use_realtime and realtime_quote.get('change_percent') is not None:
+            display_pct_change = float(realtime_quote['change_percent'])
+
+        price_source_text = "AKShare 实时快照（无缓存）" if use_realtime else "AKShare 日线收盘（实时失败回退）"
+        snapshot_time = realtime_quote.get('snapshot_time') if use_realtime else "N/A"
+
+        def fmt_hk(value: Any) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"HK${float(value):.2f}"
+            except Exception:
+                return "N/A"
+
+        def fmt_pct(value: Any) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"{float(value):.2f}%"
+            except Exception:
+                return "N/A"
+
+        def fmt_int(value: Any) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"{int(value):,d}"
+            except Exception:
+                return "N/A"
 
         # 计算 PE、PB
         pe_ratio = None
@@ -608,13 +1236,16 @@ def get_hk_stock_data_akshare(symbol: str, start_date: str = None, end_date: str
 **数据条数**: {len(df)} 条
 
 ### 最新价格信息
-- 最新价: HK${latest['close']:.2f}
-- 昨收: HK${latest['pre_close']:.2f}
-- 涨跌额: HK${latest['change']:.2f}
-- 涨跌幅: {latest['pct_change']:.2f}%
-- 最高: HK${latest['high']:.2f}
-- 最低: HK${latest['low']:.2f}
-- 成交量: {latest['volume']:,.0f}
+- 价格来源: {price_source_text}
+- 实时快照时间: {snapshot_time}
+- 最新价: {fmt_hk(current_price)}
+- 昨收: {fmt_hk(display_pre_close)}
+- 涨跌额: {fmt_hk(display_change)}
+- 涨跌幅: {fmt_pct(display_pct_change)}
+- 今开: {fmt_hk(display_open)}
+- 最高: {fmt_hk(display_high)}
+- 最低: {fmt_hk(display_low)}
+- 成交量: {fmt_int(display_volume)}
 
 ### 技术指标（最新值）
 **移动平均线**:

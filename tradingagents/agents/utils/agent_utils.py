@@ -8,6 +8,8 @@ from datetime import date, timedelta, datetime
 import functools
 import pandas as pd
 import os
+import json
+import hashlib
 from dateutil.relativedelta import relativedelta
 from langchain_openai import ChatOpenAI
 import tradingagents.dataflows.interface as interface
@@ -1084,50 +1086,19 @@ class Toolkit:
 
             result_data = []
 
-            if is_china:
-                # 中国A股：使用中国股票数据源
-                logger.info(f"🇨🇳 [统一市场工具] 处理A股市场数据...")
+            # 三市场统一入口：内部按市场与配置优先级（LongPort优先）处理
+            try:
+                from tradingagents.dataflows.interface import get_stock_data_by_market
+                market_data = get_stock_data_by_market(ticker, start_date, end_date)
 
-                try:
-                    from tradingagents.dataflows.interface import get_china_stock_data_unified
-                    stock_data = get_china_stock_data_unified(ticker, start_date, end_date)
+                logger.info(f"🔍 [市场工具调试] 返回长度: {len(market_data)}")
+                logger.info(f"🔍 [市场工具调试] 前500字符:\n{market_data[:500]}")
 
-                    # 🔍 调试：打印返回数据的前500字符
-                    logger.info(f"🔍 [市场工具调试] A股数据返回长度: {len(stock_data)}")
-                    logger.info(f"🔍 [市场工具调试] A股数据前500字符:\n{stock_data[:500]}")
-
-                    result_data.append(f"## A股市场数据\n{stock_data}")
-                except Exception as e:
-                    logger.error(f"❌ [市场工具调试] A股数据获取失败: {e}")
-                    result_data.append(f"## A股市场数据\n获取失败: {e}")
-
-            elif is_hk:
-                # 港股：使用AKShare数据源
-                logger.info(f"🇭🇰 [统一市场工具] 处理港股市场数据...")
-
-                try:
-                    from tradingagents.dataflows.interface import get_hk_stock_data_unified
-                    hk_data = get_hk_stock_data_unified(ticker, start_date, end_date)
-
-                    # 🔍 调试：打印返回数据的前500字符
-                    logger.info(f"🔍 [市场工具调试] 港股数据返回长度: {len(hk_data)}")
-                    logger.info(f"🔍 [市场工具调试] 港股数据前500字符:\n{hk_data[:500]}")
-
-                    result_data.append(f"## 港股市场数据\n{hk_data}")
-                except Exception as e:
-                    logger.error(f"❌ [市场工具调试] 港股数据获取失败: {e}")
-                    result_data.append(f"## 港股市场数据\n获取失败: {e}")
-
-            else:
-                # 美股：优先使用FINNHUB API数据源
-                logger.info(f"🇺🇸 [统一市场工具] 处理美股市场数据...")
-
-                try:
-                    from tradingagents.dataflows.providers.us.optimized import get_us_stock_data_cached
-                    us_data = get_us_stock_data_cached(ticker, start_date, end_date)
-                    result_data.append(f"## 美股市场数据\n{us_data}")
-                except Exception as e:
-                    result_data.append(f"## 美股市场数据\n获取失败: {e}")
+                section_title = "A股市场数据" if is_china else ("港股市场数据" if is_hk else "美股市场数据")
+                result_data.append(f"## {section_title}\n{market_data}")
+            except Exception as e:
+                section_title = "A股市场数据" if is_china else ("港股市场数据" if is_hk else "美股市场数据")
+                result_data.append(f"## {section_title}\n获取失败: {e}")
 
             # 组合所有数据
             combined_result = f"""# {ticker} 市场数据分析
@@ -1318,33 +1289,804 @@ class Toolkit:
             result_data = []
 
             if is_china or is_hk:
-                # 中国A股和港股：使用社交媒体情绪分析
                 logger.info(f"🇨🇳🇭🇰 [统一情绪工具] 处理中文市场情绪...")
+                import asyncio
+                import re
+                import threading
+
+                positive_keywords = [
+                    "利好", "上涨", "增长", "盈利", "突破", "创新高", "买入", "推荐",
+                    "看好", "强势", "超预期", "中标", "签约", "合作", "分红", "回购"
+                ]
+                negative_keywords = [
+                    "利空", "下跌", "亏损", "风险", "暴跌", "卖出", "警告", "下调",
+                    "看空", "弱势", "低于预期", "减持", "商誉减值", "诉讼", "停牌", "退市"
+                ]
+                risk_keywords = [
+                    "立案", "调查", "处罚", "退市", "暴跌", "跌停", "违约", "减值", "停牌"
+                ]
+
+                def _normalize_symbol_for_cn(source_name: str, raw_ticker: str) -> str:
+                    symbol = str(raw_ticker).upper()
+                    symbol = symbol.replace(".SH", "").replace(".SZ", "").replace(".SS", "")
+                    symbol = symbol.replace(".XSHG", "").replace(".XSHE", "")
+                    symbol = symbol.replace(".HK", "").replace(".HKG", "")
+                    symbol = symbol.strip()
+                    if source_name == "akshare" and symbol.isdigit():
+                        return symbol.zfill(6 if len(symbol) <= 6 else len(symbol))
+                    if source_name == "tushare" and symbol.isdigit() and len(symbol) <= 6:
+                        return symbol.zfill(6)
+                    return symbol
+
+                def _score_text(text: str) -> float:
+                    t = str(text or "").lower()
+                    if not t:
+                        return 0.0
+                    pos = sum(1 for k in positive_keywords if k in t)
+                    neg = sum(1 for k in negative_keywords if k in t)
+                    if pos + neg == 0:
+                        return 0.0
+                    return max(-1.0, min(1.0, (pos - neg) / (pos + neg)))
+
+                def _label_from_score(score: float) -> str:
+                    if score > 0.25:
+                        return "积极"
+                    if score > 0.08:
+                        return "偏积极"
+                    if score < -0.25:
+                        return "消极"
+                    if score < -0.08:
+                        return "偏消极"
+                    return "中性"
+
+                def _heat_from_count(count: int) -> str:
+                    if count >= 30:
+                        return "极高"
+                    if count >= 15:
+                        return "高"
+                    if count >= 8:
+                        return "中"
+                    return "低"
+
+                def _confidence_from_count(count: int, source_count: int, ai_used: bool) -> int:
+                    base = 25 + min(45, count * 3)
+                    source_bonus = min(20, max(0, source_count - 1) * 8)
+                    ai_penalty = 8 if ai_used else 0
+                    return int(max(5, min(95, base + source_bonus - ai_penalty)))
+
+                def _trend_hint(scores: list[float]) -> str:
+                    if len(scores) < 6:
+                        return "样本不足"
+                    recent = scores[:5]
+                    previous = scores[5:10]
+                    if not previous:
+                        return "样本不足"
+                    recent_avg = sum(recent) / len(recent)
+                    prev_avg = sum(previous) / len(previous)
+                    delta = recent_avg - prev_avg
+                    if delta > 0.08:
+                        return "升温"
+                    if delta < -0.08:
+                        return "降温"
+                    return "持平"
+
+                def _looks_unavailable_search_text(text: str) -> bool:
+                    t = str(text or "").strip()
+                    if not t:
+                        return True
+                    patterns = [
+                        "我目前无法", "目前我无法", "无法进行实时搜索", "无法为您获取",
+                        "无法直接搜索", "无法搜索社交媒体", "无法搜索", "请您自行",
+                        "建议您自行", "联网搜索插件未开通", "ToolNotOpen", "web search"
+                    ]
+                    return any(p in t for p in patterns)
+
+                def _normalize_news_item(item: dict, source_name: str) -> dict:
+                    title = str(item.get("title", "")).strip()
+                    content = str(item.get("content", "") or item.get("summary", "")).strip()
+                    publish_time = str(item.get("publish_time", "")).strip()
+                    source = str(item.get("source", "") or source_name).strip()
+                    raw_score = item.get("sentiment_score")
+                    keyword_score = _score_text(f"{title} {content}")
+                    if raw_score is None:
+                        provider_score = None
+                        score = keyword_score
+                    else:
+                        try:
+                            provider_score = float(raw_score)
+                            score = provider_score * 0.65 + keyword_score * 0.35
+                        except Exception:
+                            provider_score = None
+                            score = keyword_score
+                    score = max(-1.0, min(1.0, score))
+                    return {
+                        "title": title or "无标题",
+                        "content": content,
+                        "publish_time": publish_time or "未知时间",
+                        "source": source or source_name,
+                        "sentiment_score": score,
+                        "keyword_score": keyword_score,
+                        "provider_score": provider_score,
+                    }
+
+                def _extract_json_block(text: str) -> str:
+                    raw = str(text or "").strip()
+                    if not raw:
+                        return ""
+                    start = raw.find("{")
+                    end = raw.rfind("}")
+                    if start != -1 and end != -1 and end > start:
+                        return raw[start:end + 1]
+                    return raw
+
+                def _llm_score_news_batch(items: list[dict]) -> dict:
+                    if not items:
+                        return {"used": False, "scores": [], "note": "无样本"}
+                    try:
+                        from tradingagents.dataflows.cache import get_cache
+
+                        cfg = interface.get_config()
+                        model_name = cfg.get("quick_think_llm")
+                        if not model_name:
+                            return {"used": False, "scores": [], "note": "未配置模型"}
+                        payload_items = []
+                        for idx, x in enumerate(items[:15], start=1):
+                            payload_items.append(
+                                {
+                                    "id": idx,
+                                    "title": str(x.get("title", ""))[:200],
+                                    "content": str(x.get("content", ""))[:500],
+                                    "source": str(x.get("source", ""))[:50],
+                                }
+                            )
+
+                        signature_items = []
+                        for x in payload_items:
+                            signature_items.append(
+                                {
+                                    "title": str(x.get("title", "")).strip(),
+                                    "source": str(x.get("source", "")).strip(),
+                                    "date": str(items[x["id"] - 1].get("publish_time", "")).strip()
+                                }
+                            )
+                        signature_items = sorted(
+                            signature_items, key=lambda d: (d.get("title", ""), d.get("source", ""), d.get("date", ""))
+                        )
+                        payload_signature = json.dumps(
+                            signature_items, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                        )
+                        payload_hash = hashlib.md5(payload_signature.encode("utf-8")).hexdigest()[:16]
+                        cache_source = f"sentiment_llm_{payload_hash}"
+                        cache = get_cache()
+
+                        try:
+                            cached_key = cache.find_cached_stock_data(
+                                symbol=ticker,
+                                start_date=curr_date,
+                                end_date=curr_date,
+                                data_source=cache_source,
+                            )
+                            if cached_key:
+                                cached_raw = cache.load_stock_data(cached_key)
+                                if isinstance(cached_raw, str) and cached_raw.strip():
+                                    cached_obj = json.loads(cached_raw)
+                                    cached_scores = cached_obj.get("scores", [])
+                                    if isinstance(cached_scores, list):
+                                        return {
+                                            "used": any(x is not None for x in cached_scores),
+                                            "scores": cached_scores,
+                                            "summary": str(cached_obj.get("summary", "")),
+                                            "note": "LLM评分缓存命中",
+                                        }
+                        except Exception:
+                            pass
+
+                        client = interface._build_openai_compatible_client(cfg, scene="sentiment_scoring")
+                        prompt = (
+                            "你是A股/港股舆情情绪分析器。"
+                            "请对每条新闻输出情绪分数score（-1到1，保留2位小数），并给整体说明。"
+                            "严格返回JSON，不要markdown。\n"
+                            "JSON格式: "
+                            "{\"scores\":[{\"id\":1,\"score\":0.1}],\"summary\":\"...\"}\n"
+                            f"新闻样本: {payload_items}"
+                        )
+                        response = client.chat.completions.create(
+                            model=model_name,
+                            messages=[
+                                {"role": "system", "content": "你是严谨的金融文本情绪分类器。"},
+                                {"role": "user", "content": prompt},
+                            ],
+                            temperature=0.1,
+                            max_tokens=900,
+                        )
+                        text = interface._extract_response_text(response)
+                        json_text = _extract_json_block(text)
+                        parsed = json.loads(json_text) if json_text else {}
+                        score_items = parsed.get("scores", []) if isinstance(parsed, dict) else []
+                        score_map = {}
+                        for row in score_items:
+                            try:
+                                rid = int(row.get("id"))
+                                val = float(row.get("score"))
+                                score_map[rid] = max(-1.0, min(1.0, val))
+                            except Exception:
+                                continue
+
+                        aligned_scores = []
+                        for idx in range(1, len(payload_items) + 1):
+                            aligned_scores.append(score_map.get(idx))
+
+                        try:
+                            cache_payload = {
+                                "scores": aligned_scores,
+                                "summary": str(parsed.get("summary", "")) if isinstance(parsed, dict) else "",
+                                "created_at": datetime.utcnow().isoformat(),
+                                "payload_hash": payload_hash,
+                                "model": model_name,
+                            }
+                            cache.save_stock_data(
+                                symbol=ticker,
+                                data=json.dumps(cache_payload, ensure_ascii=False),
+                                start_date=curr_date,
+                                end_date=curr_date,
+                                data_source=cache_source,
+                            )
+                        except Exception:
+                            pass
+
+                        return {
+                            "used": any(x is not None for x in aligned_scores),
+                            "scores": aligned_scores,
+                            "summary": str(parsed.get("summary", "")) if isinstance(parsed, dict) else "",
+                            "note": "LLM评分完成(已写缓存)",
+                        }
+                    except Exception as e:
+                        return {"used": False, "scores": [], "note": f"LLM评分失败: {e}"}
+
+                def _extract_ai_news_items(ai_text: str) -> list[dict]:
+                    items = []
+                    lines = [line.strip() for line in str(ai_text or "").splitlines() if line.strip()]
+                    title_pattern = re.compile(r"^(?:[-*]\s*)?(?:\d+[.)、]\s*)?(?:标题[:：]\s*)?(.+)$")
+                    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
+                    source_pattern = re.compile(r"(?:来源|source)[:：]\s*([^\]|）)]+)", re.IGNORECASE)
+                    for line in lines:
+                        if len(line) < 8:
+                            continue
+                        if all(token not in line for token in ["来源", "source", "-", "：", ":"]) and len(line) > 120:
+                            continue
+                        match = title_pattern.match(line)
+                        if not match:
+                            continue
+                        title = match.group(1).strip()
+                        if not title or len(title) < 6:
+                            continue
+                        date_match = date_pattern.search(line)
+                        source_match = source_pattern.search(line)
+                        items.append(
+                            {
+                                "title": title[:180],
+                                "content": line[:500],
+                                "publish_time": date_match.group(1) if date_match else "未知时间",
+                                "source": source_match.group(1).strip() if source_match else "AI联网搜索",
+                                "sentiment_score": _score_text(line),
+                            }
+                        )
+                        if len(items) >= 20:
+                            break
+                    return items
+
+                def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+                    return max(low, min(high, value))
+
+                def _to_float(value) -> float:
+                    try:
+                        if value is None:
+                            return 0.0
+                        return float(value)
+                    except Exception:
+                        return 0.0
+
+                def _compute_behavior_factors(price_df) -> dict:
+                    if price_df is None or len(price_df) < 6:
+                        return {}
+
+                    try:
+                        local_df = price_df.copy()
+                        if "date" in local_df.columns:
+                            local_df = local_df.sort_values("date")
+                        else:
+                            local_df = local_df.sort_index()
+
+                        closes = [_to_float(v) for v in local_df.get("close", pd.Series(dtype=float)).tolist() if _to_float(v) > 0]
+                        volumes = [_to_float(v) for v in local_df.get("volume", pd.Series(dtype=float)).tolist()]
+
+                        if len(closes) < 6:
+                            return {}
+
+                        latest_close = closes[-1]
+                        prev_close = closes[-2]
+                        close_5 = closes[-6] if len(closes) >= 6 else closes[0]
+
+                        ret_1d = (latest_close / prev_close - 1.0) if prev_close > 0 else 0.0
+                        ret_5d = (latest_close / close_5 - 1.0) if close_5 > 0 else 0.0
+
+                        latest_volume = volumes[-1] if volumes else 0.0
+                        recent_volumes = volumes[-6:-1] if len(volumes) >= 6 else volumes[:-1]
+                        avg_volume_5 = (sum(recent_volumes) / len(recent_volumes)) if recent_volumes else 0.0
+                        volume_ratio = (latest_volume / avg_volume_5) if avg_volume_5 > 0 else 1.0
+
+                        returns = []
+                        for idx in range(1, len(closes)):
+                            prev = closes[idx - 1]
+                            curr = closes[idx]
+                            if prev > 0:
+                                returns.append(curr / prev - 1.0)
+                        recent_returns = returns[-10:] if len(returns) >= 10 else returns
+                        volatility = float(pd.Series(recent_returns).std()) if recent_returns else 0.0
+
+                        price_momentum_index = _clamp(50.0 + ret_5d * 500.0)
+                        volume_impulse_index = _clamp(50.0 + (volume_ratio - 1.0) * 40.0)
+                        volatility_pressure = _clamp(volatility * 1200.0)
+
+                        behavior_risk_appetite = _clamp(
+                            0.45 * price_momentum_index
+                            + 0.35 * volume_impulse_index
+                            + 0.20 * (100.0 - volatility_pressure)
+                        )
+
+                        if behavior_risk_appetite >= 65:
+                            behavior_label = "risk_on"
+                        elif behavior_risk_appetite <= 35:
+                            behavior_label = "risk_off"
+                        else:
+                            behavior_label = "neutral"
+
+                        return {
+                            "price_momentum_index": int(round(price_momentum_index)),
+                            "volume_impulse_index": int(round(volume_impulse_index)),
+                            "volatility_pressure": int(round(volatility_pressure)),
+                            "behavior_risk_appetite": int(round(behavior_risk_appetite)),
+                            "behavior_label": behavior_label,
+                            "ret_1d": ret_1d,
+                            "ret_5d": ret_5d,
+                            "volume_ratio": volume_ratio,
+                        }
+                    except Exception:
+                        return {}
+
+                def _compute_theme_dispersion(news_data: list[dict]) -> dict:
+                    if not news_data:
+                        return {
+                            "theme_dispersion_index": 0,
+                            "theme_entropy": 0.0,
+                            "theme_balance": 0.0,
+                            "dominant_themes": "无",
+                            "theme_polarity_spread": 0.0,
+                            "theme_count": 0,
+                        }
+
+                    theme_keywords = {
+                        "政策监管": ["政策", "监管", "证监会", "央行", "国务院", "规则", "指导意见"],
+                        "业绩基本面": ["业绩", "财报", "营收", "净利润", "分红", "回购", "估值"],
+                        "资金交易": ["资金", "北向", "成交量", "换手", "增持", "减持", "主力"],
+                        "行业景气": ["行业", "景气", "产业", "需求", "供给", "产能", "订单"],
+                        "风险事件": ["风险", "诉讼", "处罚", "违约", "立案", "停牌", "退市", "减值"],
+                    }
+                    buckets = {k: {"scores": [], "count": 0} for k in theme_keywords.keys()}
+                    buckets["其他"] = {"scores": [], "count": 0}
+
+                    for item in news_data:
+                        text = f"{item.get('title', '')} {item.get('content', '')}"
+                        score = float(item.get("sentiment_score", 0.0))
+                        matched_theme = None
+                        for theme_name, kws in theme_keywords.items():
+                            if any(k in text for k in kws):
+                                matched_theme = theme_name
+                                break
+                        if not matched_theme:
+                            matched_theme = "其他"
+                        buckets[matched_theme]["scores"].append(score)
+                        buckets[matched_theme]["count"] += 1
+
+                    active_themes = {k: v for k, v in buckets.items() if v["count"] > 0}
+                    total = sum(v["count"] for v in active_themes.values())
+                    if total <= 0:
+                        return {
+                            "theme_dispersion_index": 0,
+                            "theme_entropy": 0.0,
+                            "theme_balance": 0.0,
+                            "dominant_themes": "无",
+                            "theme_polarity_spread": 0.0,
+                            "theme_count": 0,
+                        }
+
+                    import math
+                    theme_avg_scores = []
+                    entropy_raw = 0.0
+                    max_ratio = 0.0
+                    ranked = sorted(active_themes.items(), key=lambda x: x[1]["count"], reverse=True)
+                    for _, info in ranked:
+                        ratio = info["count"] / total
+                        max_ratio = max(max_ratio, ratio)
+                        entropy_raw += -(ratio * math.log(ratio)) if ratio > 0 else 0.0
+                        avg_score = sum(info["scores"]) / len(info["scores"]) if info["scores"] else 0.0
+                        theme_avg_scores.append(avg_score)
+
+                    theme_count = len(active_themes)
+                    entropy_norm = 0.0
+                    if theme_count > 1:
+                        entropy_norm = entropy_raw / math.log(theme_count)
+                    theme_balance = max(0.0, 1.0 - max_ratio)
+                    polarity_spread = max(theme_avg_scores) - min(theme_avg_scores) if len(theme_avg_scores) > 1 else 0.0
+
+                    theme_dispersion_index = _clamp(
+                        polarity_spread * 55.0 + entropy_norm * 30.0 + theme_balance * 25.0
+                    )
+                    dominant = " / ".join([x[0] for x in ranked[:2]])
+
+                    return {
+                        "theme_dispersion_index": int(round(theme_dispersion_index)),
+                        "theme_entropy": round(entropy_norm, 3),
+                        "theme_balance": round(theme_balance, 3),
+                        "dominant_themes": dominant,
+                        "theme_polarity_spread": round(polarity_spread, 3),
+                        "theme_count": theme_count,
+                    }
+
+                def _run_async(coro_factory):
+                    try:
+                        return asyncio.run(coro_factory())
+                    except RuntimeError as rt_err:
+                        if "running event loop" not in str(rt_err).lower():
+                            raise
+                        holder = {"value": None, "error": None}
+
+                        def _runner():
+                            loop = asyncio.new_event_loop()
+                            try:
+                                asyncio.set_event_loop(loop)
+                                holder["value"] = loop.run_until_complete(coro_factory())
+                            except Exception as e:
+                                holder["error"] = e
+                            finally:
+                                loop.close()
+
+                        th = threading.Thread(target=_runner, daemon=True)
+                        th.start()
+                        th.join(timeout=45)
+                        if th.is_alive():
+                            return None
+                        if holder["error"] is not None:
+                            raise holder["error"]
+                        return holder["value"]
+
+                news_items = []
+                used_sources = []
+                data_quality_notes = []
+                source_errors = []
+                ai_fallback_used = False
+                llm_sentiment_summary = ""
+                llm_notes = []
+
+                has_tushare_token = bool(os.getenv("TUSHARE_TOKEN", "").strip())
+                source_priority = ["tushare", "akshare"] if has_tushare_token else ["akshare", "tushare"]
+                data_quality_notes.append(
+                    f"TUSHARE_TOKEN检测: {'已配置' if has_tushare_token else '未配置'}，优先级: {' > '.join(source_priority)}"
+                )
+                behavior_factors = {}
+                behavior_source = ""
+                behavior_notes = []
 
                 try:
-                    # 可以集成微博、雪球、东方财富等中文社交媒体情绪
-                    # 目前使用基础的情绪分析
-                    sentiment_summary = f"""
+                    end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
+                    start_dt = end_dt - timedelta(days=35)
+                    start_date_behavior = start_dt.strftime("%Y-%m-%d")
+                except Exception:
+                    start_date_behavior = curr_date
+
+                for source_name in source_priority:
+                    if behavior_factors:
+                        break
+                    try:
+                        if source_name == "tushare":
+                            from tradingagents.dataflows.providers.china.tushare import get_tushare_provider
+
+                            tushare_provider = get_tushare_provider()
+                            if not tushare_provider or not tushare_provider.is_available():
+                                behavior_notes.append("行为因子: Tushare不可用")
+                                continue
+                            price_df = _run_async(
+                                lambda: tushare_provider.get_historical_data(
+                                    symbol=ticker,
+                                    start_date=start_date_behavior,
+                                    end_date=curr_date,
+                                    period="daily",
+                                )
+                            )
+                            behavior_factors = _compute_behavior_factors(price_df)
+                            if behavior_factors:
+                                behavior_source = "Tushare"
+                            else:
+                                behavior_notes.append("行为因子: Tushare行情样本不足")
+                        else:
+                            from tradingagents.dataflows.providers.china.akshare import AKShareProvider
+
+                            ak_provider = AKShareProvider()
+                            ak_symbol = _normalize_symbol_for_cn("akshare", ticker)
+                            price_df = _run_async(
+                                lambda: ak_provider.get_historical_data(
+                                    code=ak_symbol,
+                                    start_date=start_date_behavior,
+                                    end_date=curr_date,
+                                    period="daily",
+                                )
+                            )
+                            behavior_factors = _compute_behavior_factors(price_df)
+                            if behavior_factors:
+                                behavior_source = "AKShare"
+                            else:
+                                behavior_notes.append("行为因子: AKShare行情样本不足")
+                    except Exception as behavior_error:
+                        behavior_notes.append(f"行为因子: {source_name} 获取失败({behavior_error})")
+
+                for source_name in source_priority:
+                    if news_items:
+                        break
+                    try:
+                        if source_name == "tushare":
+                            from tradingagents.dataflows.providers.china.tushare import get_tushare_provider
+
+                            tushare_provider = get_tushare_provider()
+                            if not tushare_provider or not tushare_provider.is_available():
+                                data_quality_notes.append("Tushare不可用或未完成连接，跳过。")
+                                continue
+
+                            ts_symbol = _normalize_symbol_for_cn("tushare", ticker)
+                            raw_news = _run_async(
+                                lambda: tushare_provider.get_stock_news(
+                                    symbol=ts_symbol, limit=20, hours_back=168
+                                )
+                            )
+                            raw_news = raw_news or []
+                            normalized = [_normalize_news_item(item, "Tushare") for item in raw_news if isinstance(item, dict)]
+                            if normalized:
+                                news_items = normalized
+                                used_sources.append("Tushare")
+                                logger.info(f"✅ [统一情绪工具] Tushare命中新闻: {len(news_items)}")
+                            else:
+                                data_quality_notes.append("Tushare返回空新闻。")
+                        else:
+                            from tradingagents.dataflows.providers.china.akshare import AKShareProvider
+
+                            ak_provider = AKShareProvider()
+                            ak_symbol = _normalize_symbol_for_cn("akshare", ticker)
+                            news_df = ak_provider.get_stock_news_sync(symbol=ak_symbol, limit=20)
+                            normalized = []
+                            if news_df is not None and not news_df.empty:
+                                for _, row in news_df.head(20).iterrows():
+                                    normalized.append(
+                                        _normalize_news_item(
+                                            {
+                                                "title": row.get("新闻标题", "") or row.get("标题", ""),
+                                                "content": row.get("新闻内容", "") or row.get("内容", ""),
+                                                "summary": row.get("新闻摘要", "") or row.get("摘要", ""),
+                                                "publish_time": row.get("发布时间", "") or row.get("时间", ""),
+                                                "source": row.get("新闻来源", "") or row.get("文章来源", "") or "东方财富",
+                                            },
+                                            "AKShare",
+                                        )
+                                    )
+                            if normalized:
+                                news_items = normalized
+                                used_sources.append("AKShare")
+                                logger.info(f"✅ [统一情绪工具] AKShare命中新闻: {len(news_items)}")
+                            else:
+                                data_quality_notes.append("AKShare返回空新闻。")
+                    except Exception as source_error:
+                        source_errors.append(f"{source_name}: {source_error}")
+                        data_quality_notes.append(f"{source_name} 获取失败，已尝试回退。")
+
+                if not news_items:
+                    try:
+                        ai_news_text = interface.get_stock_news_openai(ticker, curr_date)
+                        if ai_news_text and not _looks_unavailable_search_text(ai_news_text):
+                            ai_items = _extract_ai_news_items(ai_news_text)
+                            if not ai_items:
+                                ai_items = [
+                                    {
+                                        "title": "AI联网新闻摘要",
+                                        "content": ai_news_text[:1200],
+                                        "publish_time": curr_date,
+                                        "source": "AI联网搜索",
+                                        "sentiment_score": _score_text(ai_news_text),
+                                    }
+                                ]
+                            news_items = [_normalize_news_item(item, "AI联网搜索") for item in ai_items]
+                            used_sources.append("AI联网搜索回退")
+                            ai_fallback_used = True
+                            data_quality_notes.append("主备新闻源均不可用，已使用AI联网搜索回退。")
+                        else:
+                            data_quality_notes.append("AI联网搜索返回不可用结果。")
+                    except Exception as ai_error:
+                        source_errors.append(f"ai_search: {ai_error}")
+                        data_quality_notes.append("AI联网搜索失败。")
+
+                if news_items:
+                    llm_result = _llm_score_news_batch(news_items)
+                    if llm_result.get("used"):
+                        for idx, item in enumerate(news_items):
+                            llm_score = None
+                            if idx < len(llm_result.get("scores", [])):
+                                llm_score = llm_result["scores"][idx]
+                            if llm_score is None:
+                                continue
+                            provider_score = item.get("provider_score")
+                            keyword_score = float(item.get("keyword_score", item.get("sentiment_score", 0.0)))
+                            if provider_score is None:
+                                merged = 0.75 * llm_score + 0.25 * keyword_score
+                            else:
+                                merged = 0.55 * llm_score + 0.30 * float(provider_score) + 0.15 * keyword_score
+                            item["llm_score"] = llm_score
+                            item["sentiment_score"] = max(-1.0, min(1.0, merged))
+                        llm_sentiment_summary = str(llm_result.get("summary", "")).strip()
+                        llm_notes.append("LLM批量情绪评分已启用（关键词仅作兜底）。")
+                        if llm_result.get("note"):
+                            llm_notes.append(str(llm_result.get("note")))
+                    else:
+                        llm_notes.append(str(llm_result.get("note", "LLM评分未启用")))
+
+                if not news_items:
+                    behavior_temp = behavior_factors.get("behavior_risk_appetite", 50)
+                    behavior_divergence = behavior_factors.get("volatility_pressure", 0)
+                    theme_metrics = _compute_theme_dispersion([])
+                    behavior_momentum = "样本不足"
+                    if behavior_factors:
+                        ret_5d = behavior_factors.get("ret_5d", 0.0)
+                        if ret_5d > 0.015:
+                            behavior_momentum = "升温"
+                        elif ret_5d < -0.015:
+                            behavior_momentum = "降温"
+                        else:
+                            behavior_momentum = "持平"
+                    failed_report = f"""
 ## 中文市场情绪分析
 
 **股票**: {ticker} ({market_info['market_name']})
 **分析日期**: {curr_date}
 
 ### 市场情绪概况
-- 由于中文社交媒体情绪数据源暂未完全集成，当前提供基础分析
-- 建议关注雪球、东方财富、同花顺等平台的讨论热度
-- 港股市场还需关注香港本地财经媒体情绪
+- 当前未获取到可用情绪样本，情绪面暂无法定量评估。
 
 ### 情绪指标
-- 整体情绪: 中性
-- 讨论热度: 待分析
-- 投资者信心: 待评估
+- 情绪温度(0-100): {int(behavior_temp)}
+- 情绪方向: 中性
+- 情绪分歧度(0-100): {int(round(behavior_divergence * 0.75 + theme_metrics.get('theme_dispersion_index', 0) * 0.25))}
+- 主题分化度(0-100): {theme_metrics.get('theme_dispersion_index', 0)}
+- 风险偏好(0-100): {int(behavior_temp)}
+- 情绪动量: {behavior_momentum}
+- confidence: 5
 
-*注：完整的中文社交媒体情绪分析功能正在开发中*
+### 行为情绪因子
+- 行情来源: {behavior_source or '不可用'}
+- 价格动量指数(0-100): {behavior_factors.get('price_momentum_index', 50)}
+- 量能冲击指数(0-100): {behavior_factors.get('volume_impulse_index', 50)}
+- 波动压力指数(0-100): {behavior_factors.get('volatility_pressure', 0)}
+- 主导主题: {theme_metrics.get('dominant_themes', '无')}
+
+### 数据质量说明
+- {'；'.join(data_quality_notes) if data_quality_notes else '未获取到数据源说明'}
+- {'；'.join(behavior_notes) if behavior_notes else '行为因子无额外告警'}
+- {'；'.join(llm_notes) if llm_notes else 'LLM情绪评分无额外说明'}
+- 错误明细: {' | '.join(source_errors) if source_errors else '无'}
+"""
+                    result_data.append(failed_report)
+                else:
+                    scores = [float(item.get("sentiment_score", 0.0)) for item in news_items]
+                    overall_score = sum(scores) / len(scores) if scores else 0.0
+                    theme_metrics = _compute_theme_dispersion(news_items)
+                    sentiment_label = _label_from_score(overall_score)
+                    heat = _heat_from_count(len(news_items))
+                    confidence = _confidence_from_count(len(news_items), len(used_sources), ai_fallback_used)
+                    trend_hint = _trend_hint(scores)
+
+                    text_all = " ".join(
+                        f"{item.get('title', '')} {item.get('content', '')}" for item in news_items
+                    )
+                    positive_hits = sum(1 for k in positive_keywords if k in text_all)
+                    negative_hits = sum(1 for k in negative_keywords if k in text_all)
+                    risk_hits = sum(1 for k in risk_keywords if k in text_all)
+                    sample_count = len(scores)
+                    if sample_count > 1:
+                        variance = sum((s - overall_score) ** 2 for s in scores) / sample_count
+                        std_dev = variance ** 0.5
+                    else:
+                        std_dev = 0.0
+
+                    text_temperature = int(max(0, min(100, 50 + overall_score * 50)))
+                    sentiment_divergence = int(max(0, min(100, std_dev * 100)))
+                    momentum_value = 0.0
+                    if len(scores) >= 6:
+                        momentum_value = (sum(scores[:5]) / 5) - (sum(scores[5:10]) / len(scores[5:10]))
+
+                    text_risk_appetite = int(max(
+                        0,
+                        min(
+                            100,
+                            50 + (positive_hits - negative_hits) * 3 - risk_hits * 4 + overall_score * 15,
+                        ),
+                    ))
+                    behavior_risk = int(behavior_factors.get("behavior_risk_appetite", text_risk_appetite))
+                    sentiment_temperature = int(round(text_temperature * 0.6 + behavior_risk * 0.4))
+                    risk_appetite = int(round(text_risk_appetite * 0.55 + behavior_risk * 0.45))
+                    if behavior_factors:
+                        sentiment_divergence = int(round(sentiment_divergence * 0.55 + behavior_factors.get("volatility_pressure", 0) * 0.20 + theme_metrics.get("theme_dispersion_index", 0) * 0.25))
+                    else:
+                        sentiment_divergence = int(round(sentiment_divergence * 0.75 + theme_metrics.get("theme_dispersion_index", 0) * 0.25))
+
+                    source_diversity = len(set(item.get("source", "") for item in news_items if item.get("source")))
+
+                    behavior_momentum_label = "样本不足"
+                    if behavior_factors:
+                        if behavior_factors.get("ret_5d", 0.0) > 0.015:
+                            behavior_momentum_label = "升温"
+                        elif behavior_factors.get("ret_5d", 0.0) < -0.015:
+                            behavior_momentum_label = "降温"
+                        else:
+                            behavior_momentum_label = "持平"
+
+                    signal_lines = [
+                        f"- 情绪正负比: 正向{positive_hits} / 负向{negative_hits}",
+                        f"- 风险事件密度: {risk_hits} 次关键词触发",
+                        f"- 样本覆盖: {len(news_items)} 条，来源数 {source_diversity}",
+                        f"- 文本动量: {trend_hint} ({momentum_value:+.2f})",
+                        f"- 行为动量: {behavior_momentum_label}",
+                        f"- 主导主题: {theme_metrics.get('dominant_themes', '无')} (主题数: {theme_metrics.get('theme_count', 0)})",
+                        f"- 主题情绪价差: {theme_metrics.get('theme_polarity_spread', 0.0):.2f}",
+                    ]
+                    if llm_sentiment_summary:
+                        signal_lines.append(f"- 模型情绪摘要: {llm_sentiment_summary[:120]}")
+
+                    sentiment_summary = f"""
+## 中文市场情绪分析
+
+**股票**: {ticker} ({market_info['market_name']})
+**分析日期**: {curr_date}
+**数据来源**: {' -> '.join(used_sources)}
+
+### 市场情绪概况
+- 总体情绪: **{sentiment_label}**（overall_score: {overall_score:.2f}）
+- 情绪温度: {sentiment_temperature}/100
+
+### 情绪指标
+- 情绪温度(0-100): {sentiment_temperature}
+- 情绪方向: {sentiment_label}
+- 情绪分歧度(0-100): {sentiment_divergence}
+- 主题分化度(0-100): {theme_metrics.get('theme_dispersion_index', 0)}
+- 风险偏好(0-100): {risk_appetite}
+- 情绪动量: 文本{trend_hint} / 行为{behavior_momentum_label}
+- 情绪基准分(overall_score): {overall_score:.2f}
+- 热度分层: {heat}
+- confidence: {confidence}
+
+### 行为情绪因子
+- 行情来源: {behavior_source or '不可用'}
+- 价格动量指数(0-100): {behavior_factors.get('price_momentum_index', 50)}
+- 量能冲击指数(0-100): {behavior_factors.get('volume_impulse_index', 50)}
+- 波动压力指数(0-100): {behavior_factors.get('volatility_pressure', 0)}
+- 行为风险偏好(0-100): {behavior_factors.get('behavior_risk_appetite', risk_appetite)}
+- 主导主题: {theme_metrics.get('dominant_themes', '无')}
+- 主题分布熵(0-1): {theme_metrics.get('theme_entropy', 0.0)}
+
+### 情绪驱动因子摘要
+{chr(10).join(signal_lines)}
+
+### 数据质量说明
+- {'；'.join(data_quality_notes) if data_quality_notes else '无异常'}
+- {'；'.join(behavior_notes) if behavior_notes else '行为因子无额外告警'}
+- {'；'.join(llm_notes) if llm_notes else 'LLM情绪评分无额外说明'}
+- 错误明细: {' | '.join(source_errors) if source_errors else '无'}
 """
                     result_data.append(sentiment_summary)
-                except Exception as e:
-                    result_data.append(f"## 中文市场情绪\n获取失败: {e}")
 
             else:
                 # 美股：使用Reddit情绪分析
