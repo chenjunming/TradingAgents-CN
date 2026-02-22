@@ -1,0 +1,121 @@
+# TradingAgents-CN Docker Hub 部署文件（兼容版）
+# 说明：
+# - 避免使用 ${VAR:-default} 语法，兼容部分可视化面板解析器
+# - 后端业务配置从宿主机 .env 注入
+
+services:
+  mongodb:
+    image: mongo:4.4
+    container_name: tradingagents-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: tradingagents123
+      MONGO_INITDB_DATABASE: tradingagents
+      TZ: Asia/Shanghai
+    volumes:
+      - tradingagents_mongodb_data:/data/db
+    networks:
+      - tradingagents-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongo localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    container_name: tradingagents-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass tradingagents123
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - tradingagents_redis_data:/data
+    networks:
+      - tradingagents-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "tradingagents123", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  backend:
+    image: chenjunming123/tradingagents-backend:latest
+    container_name: tradingagents-backend
+    restart: unless-stopped
+    env_file:
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/.env
+    environment:
+      TZ: Asia/Shanghai
+      DOCKER_CONTAINER: "true"
+      # 美股数据源优先级（环境变量强制覆盖数据库）
+      TA_US_ENABLED_SOURCES: "longport,yfinance"
+      TA_US_SOURCE_PRIORITY: "longport,yfinance"
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      MONGODB_HOST: "mongodb"
+      MONGODB_PORT: "27017"
+      MONGODB_USERNAME: "admin"
+      MONGODB_PASSWORD: "tradingagents123"
+      MONGODB_DATABASE: "tradingagents"
+      MONGODB_AUTH_SOURCE: "admin"
+      MONGODB_URL: "mongodb://admin:tradingagents123@mongodb:27017/tradingagents?authSource=admin"
+      MONGODB_CONNECTION_STRING: "mongodb://admin:tradingagents123@mongodb:27017/tradingagents?authSource=admin"
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: "tradingagents123"
+      REDIS_DB: "0"
+      REDIS_URL: "redis://:tradingagents123@redis:6379/0"
+      CORS_ORIGINS: "*"
+    ports:
+      - "18000:8000"
+    volumes:
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/logs:/app/logs
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/data:/app/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tradingagents-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    image: chenjunming123/tradingagents-frontend:latest
+    container_name: tradingagents-frontend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      VITE_API_BASE_URL: "http://localhost:8000"
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - tradingagents-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  tradingagents_mongodb_data:
+    driver: local
+  tradingagents_redis_data:
+    driver: local
+
+networks:
+  tradingagents-network:
+    driver: bridge

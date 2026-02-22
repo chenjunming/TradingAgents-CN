@@ -46,6 +46,7 @@ class USDataSource(Enum):
     值使用统一的数据源编码
     """
     MONGODB = DataSourceCode.MONGODB  # MongoDB数据库缓存（最高优先级）
+    LONGPORT = DataSourceCode.LONGPORT  # LongPort（长桥，优先实时行情）
     YFINANCE = DataSourceCode.YFINANCE  # Yahoo Finance（免费，股票价格和技术指标）
     ALPHA_VANTAGE = DataSourceCode.ALPHA_VANTAGE  # Alpha Vantage（基本面和新闻）
     FINNHUB = DataSourceCode.FINNHUB  # Finnhub（备用数据源）
@@ -1690,9 +1691,9 @@ class DataSourceManager:
     def _get_akshare_stock_info(self, symbol: str) -> Dict:
         """使用AKShare获取股票基本信息
 
-        🔥 重要：AKShare 需要区分股票和指数
-        - 对于 000001，如果不加后缀，会被识别为"深圳成指"（指数）
-        - 对于股票，需要使用完整代码（如 sz000001 或 sh600000）
+        兼容不同 AKShare 版本的入参差异：
+        - 近期版本对 `stock_individual_info_em` 更稳定的入参是 6 位纯数字代码
+        - 某些旧版本可能接受带交易所前缀的代码（如 sh600000 / sz000001）
         """
         try:
             from tradingagents.utils.stock_utils import StockUtils, StockMarket
@@ -1702,25 +1703,24 @@ class DataSourceManager:
 
             import akshare as ak
 
-            # 🔥 转换为 AKShare 格式的股票代码
-            # AKShare 的 stock_individual_info_em 需要使用 "sz000001" 或 "sh600000" 格式
-            if symbol.startswith('6'):
-                # 上海股票：600000 -> sh600000
-                akshare_symbol = f"sh{symbol}"
-            elif symbol.startswith(('0', '3', '2')):
-                # 深圳股票：000001 -> sz000001
-                akshare_symbol = f"sz{symbol}"
-            elif symbol.startswith(('8', '4')):
-                # 北京股票：830000 -> bj830000
-                akshare_symbol = f"bj{symbol}"
-            else:
-                # 其他情况，直接使用原始代码
-                akshare_symbol = symbol
+            code6 = str(symbol or "").strip().zfill(6)
+            logger.debug(f"📊 [AKShare股票信息] 原始代码: {symbol}, 6位代码: {code6}")
 
-            logger.debug(f"📊 [AKShare股票信息] 原始代码: {symbol}, AKShare格式: {akshare_symbol}")
-
-            # 尝试获取个股信息
-            stock_info = ak.stock_individual_info_em(symbol=akshare_symbol)
+            # 优先使用 6 位纯代码（新版本兼容性更好）
+            try:
+                stock_info = ak.stock_individual_info_em(symbol=code6)
+            except Exception as e:
+                logger.warning(f"⚠️ [AKShare股票信息] 6位代码查询失败，尝试带前缀格式: {code6}, 错误: {e}")
+                # 兼容回退：极少数版本可能需要前缀
+                if code6.startswith('6'):
+                    akshare_symbol = f"sh{code6}"
+                elif code6.startswith(('0', '3', '2')):
+                    akshare_symbol = f"sz{code6}"
+                elif code6.startswith(('8', '4')):
+                    akshare_symbol = f"bj{code6}"
+                else:
+                    akshare_symbol = code6
+                stock_info = ak.stock_individual_info_em(symbol=akshare_symbol)
 
             if stock_info is not None and not stock_info.empty:
                 # 转换为字典格式
@@ -2342,6 +2342,36 @@ class USDataSourceManager:
         logger.info(f"   默认数据源: {self.default_source.value}")
         logger.info(f"   可用数据源: {[s.value for s in self.available_sources]}")
 
+    @staticmethod
+    def _normalize_us_source_name(name: str) -> str:
+        """标准化美股数据源名称（兼容别名与中划线/空格差异）。"""
+        key = str(name or "").strip().lower().replace("-", "_")
+        mapping = {
+            "longport": "longport",
+            "yfinance": "yfinance",
+            "yahoo_finance": "yfinance",
+            "yahoo finance": "yfinance",
+            "alpha_vantage": "alpha_vantage",
+            "alpha vantage": "alpha_vantage",
+            "finnhub": "finnhub",
+        }
+        return mapping.get(key, key)
+
+    def _get_env_us_sources(self, env_var: str) -> Optional[List[str]]:
+        """
+        从环境变量读取美股数据源列表（逗号分隔）。
+        示例：TA_US_SOURCE_PRIORITY=longport,yfinance
+        """
+        raw = os.getenv(env_var)
+        if raw is None:
+            return None
+        items = [self._normalize_us_source_name(x) for x in raw.split(",") if str(x).strip()]
+        deduped = []
+        for x in items:
+            if x not in deduped:
+                deduped.append(x)
+        return deduped
+
     def _check_mongodb_enabled(self) -> bool:
         """检查是否启用MongoDB缓存"""
         from tradingagents.config.runtime_settings import use_app_cache_enabled
@@ -2357,6 +2387,25 @@ class USDataSourceManager:
         Returns:
             按优先级排序的数据源列表（不包含MongoDB）
         """
+        # 0) 环境变量强制优先级（最高优先级，覆盖数据库）
+        env_priority = self._get_env_us_sources("TA_US_SOURCE_PRIORITY")
+        if env_priority:
+            source_mapping = {
+                'longport': USDataSource.LONGPORT,
+                'yfinance': USDataSource.YFINANCE,
+                'alpha_vantage': USDataSource.ALPHA_VANTAGE,
+                'finnhub': USDataSource.FINNHUB,
+            }
+            result = []
+            for ds_name in env_priority:
+                source = source_mapping.get(ds_name)
+                if source and source != USDataSource.MONGODB and source in self.available_sources:
+                    result.append(source)
+            if result:
+                logger.info(f"✅ [美股数据源优先级] 从环境变量 TA_US_SOURCE_PRIORITY 读取: {[s.value for s in result]}")
+                return result
+            logger.warning("⚠️ [美股数据源优先级] TA_US_SOURCE_PRIORITY 已配置但无可用数据源，继续尝试数据库配置")
+
         try:
             # 从数据库读取数据源配置
             from app.core.database import get_mongo_db_sync
@@ -2373,15 +2422,17 @@ class USDataSourceManager:
                 # 转换为 USDataSource 枚举
                 # 🔥 数据源名称映射（数据库名称 → USDataSource 枚举）
                 source_mapping = {
+                    'longport': USDataSource.LONGPORT,
                     'yfinance': USDataSource.YFINANCE,
                     'yahoo_finance': USDataSource.YFINANCE,  # 别名
+                    'yahoo finance': USDataSource.YFINANCE,  # 别名（数据库常见名称）
                     'alpha_vantage': USDataSource.ALPHA_VANTAGE,
                     'finnhub': USDataSource.FINNHUB,
                 }
 
                 result = []
                 for grouping in groupings:
-                    ds_name = grouping.get('data_source_name', '').lower()
+                    ds_name = self._normalize_us_source_name(grouping.get('data_source_name', ''))
                     if ds_name in source_mapping:
                         source = source_mapping[ds_name]
                         # 排除 MongoDB（MongoDB 是最高优先级，不参与降级）
@@ -2397,8 +2448,9 @@ class USDataSourceManager:
             logger.warning(f"⚠️ [美股数据源优先级] 从数据库读取失败: {e}，使用默认顺序")
 
         # 回退到默认顺序
-        # 默认顺序：yfinance > Alpha Vantage > Finnhub
+        # 默认顺序：LongPort > yfinance > Alpha Vantage > Finnhub
         default_order = [
+            USDataSource.LONGPORT,
             USDataSource.YFINANCE,
             USDataSource.ALPHA_VANTAGE,
             USDataSource.FINNHUB,
@@ -2417,6 +2469,7 @@ class USDataSourceManager:
 
         # 映射到枚举
         source_mapping = {
+            DataSourceCode.LONGPORT: USDataSource.LONGPORT,
             DataSourceCode.YFINANCE: USDataSource.YFINANCE,
             DataSourceCode.ALPHA_VANTAGE: USDataSource.ALPHA_VANTAGE,
             DataSourceCode.FINNHUB: USDataSource.FINNHUB,
@@ -2437,9 +2490,23 @@ class USDataSourceManager:
             available.append(USDataSource.MONGODB)
             logger.info("✅ MongoDB缓存数据源可用")
 
-        # 从数据库读取启用的数据源列表和配置
+        # 从环境变量或数据库读取启用的数据源列表（环境变量优先）
         enabled_sources_in_db = self._get_enabled_sources_from_db()
         datasource_configs = self._get_datasource_configs_from_db()
+
+        # 检查 LongPort
+        if 'longport' in enabled_sources_in_db:
+            try:
+                from tradingagents.dataflows.interface import _has_longport_credentials
+                if _has_longport_credentials():
+                    available.append(USDataSource.LONGPORT)
+                    logger.info("✅ LongPort数据源可用且已启用")
+                else:
+                    logger.warning("⚠️ LongPort数据源不可用: 凭证未配置（LONGPORT_APP_KEY/SECRET/ACCESS_TOKEN）")
+            except Exception as e:
+                logger.warning(f"⚠️ LongPort数据源检查失败: {e}")
+        else:
+            logger.info("ℹ️ LongPort数据源已在数据库中禁用")
 
         # 检查 yfinance
         if 'yfinance' in enabled_sources_in_db:
@@ -2487,7 +2554,12 @@ class USDataSourceManager:
         return available
 
     def _get_enabled_sources_from_db(self) -> List[str]:
-        """从数据库读取启用的数据源列表"""
+        """读取启用的数据源列表。优先环境变量 TA_US_ENABLED_SOURCES，回退数据库。"""
+        env_sources = self._get_env_us_sources("TA_US_ENABLED_SOURCES")
+        if env_sources:
+            logger.info(f"✅ [美股数据源启用列表] 从环境变量 TA_US_ENABLED_SOURCES 读取: {env_sources}")
+            return env_sources
+
         try:
             from app.core.database import get_mongo_db_sync
             db = get_mongo_db_sync()
@@ -2498,18 +2570,10 @@ class USDataSourceManager:
                 "enabled": True
             }))
 
-            # 🔥 数据源名称映射（数据库名称 → 代码中使用的名称）
-            name_mapping = {
-                'alpha vantage': 'alpha_vantage',
-                'yahoo finance': 'yfinance',
-                'finnhub': 'finnhub',
-            }
-
             result = []
             for g in groupings:
-                db_name = g.get('data_source_name', '').lower()
-                # 使用映射表转换名称
-                code_name = name_mapping.get(db_name, db_name)
+                db_name = g.get('data_source_name', '')
+                code_name = self._normalize_us_source_name(db_name)
                 result.append(code_name)
                 logger.debug(f"🔄 数据源名称映射: '{db_name}' → '{code_name}'")
 
@@ -2517,7 +2581,7 @@ class USDataSourceManager:
         except Exception as e:
             logger.warning(f"⚠️ 从数据库读取启用的数据源失败: {e}")
             # 默认全部启用
-            return ['yfinance', 'alpha_vantage', 'finnhub']
+            return ['longport', 'yfinance', 'alpha_vantage', 'finnhub']
 
     def _get_datasource_configs_from_db(self) -> dict:
         """从数据库读取数据源配置（包括 API Key）"""

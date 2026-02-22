@@ -12,6 +12,24 @@ from app.models.advisor_models import DailyBriefResponse, FeishuCommandResponse
 
 
 class FeishuPushService:
+    @staticmethod
+    def _normalize_receive_target(
+        chat_id: Optional[str] = None,
+        receive_id_type: Optional[str] = None,
+        receive_id: Optional[str] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        rid = str(receive_id or "").strip()
+        rtype = str(receive_id_type or "").strip().lower()
+        if rid:
+            if not rtype:
+                rtype = "chat_id"
+            return rtype, rid
+
+        cid = str(chat_id or "").strip()
+        if cid:
+            return "chat_id", cid
+        return None, None
+
     def _render_rich_markdown(self, lines: list[str]) -> str:
         # 富文本（Markdown）内容：空行分段，保持已有 markdown 语法。
         content = "\n".join([str(x) for x in lines]).strip()
@@ -75,6 +93,8 @@ class FeishuPushService:
         chat_id: str,
         text: str,
         reply_to_message_id: Optional[str] = None,
+        receive_id_type: Optional[str] = None,
+        receive_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         # 默认使用富文本卡片（Markdown）发送；失败再降级纯文本，保证消息可达。
         card = self._build_simple_card(
@@ -87,21 +107,34 @@ class FeishuPushService:
             card,
             action="send_text_as_card",
             reply_to_message_id=reply_to_message_id,
+            receive_id_type=receive_id_type,
+            receive_id=receive_id,
         )
         if card_result.get("success"):
             return card_result
 
-        return await self._send_plain_text(chat_id, text, reply_to_message_id=reply_to_message_id)
+        return await self._send_plain_text(
+            chat_id,
+            text,
+            reply_to_message_id=reply_to_message_id,
+            receive_id_type=receive_id_type,
+            receive_id=receive_id,
+        )
 
     async def _send_plain_text(
         self,
         chat_id: str,
         text: str,
         reply_to_message_id: Optional[str] = None,
+        receive_id_type: Optional[str] = None,
+        receive_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         token = await self._get_tenant_access_token()
         if not token:
             return {"success": False, "message": "missing_feishu_credentials"}
+        target_type, target_id = self._normalize_receive_target(chat_id, receive_id_type, receive_id)
+        if not target_type or not target_id:
+            return {"success": False, "message": "missing_feishu_receive_target"}
 
         url = f"{settings.FEISHU_BOT_API_BASE}/open-apis/im/v1/messages"
         reply_target = str(reply_to_message_id or "").strip()
@@ -124,9 +157,9 @@ class FeishuPushService:
             if reply_target:
                 data = await _post("message_id", reply_target)
                 if data.get("code") != 0:
-                    data = await _post("chat_id", chat_id)
+                    data = await _post(target_type, target_id)
             else:
-                data = await _post("chat_id", chat_id)
+                data = await _post(target_type, target_id)
         except Exception as exc:
             data = {"code": -1, "msg": str(exc), "error_type": type(exc).__name__}
 
@@ -135,6 +168,8 @@ class FeishuPushService:
             await db.feishu_message_logs.insert_one(
                 {
                     "chat_id": chat_id,
+                    "receive_id_type": target_type,
+                    "receive_id": target_id,
                     "reply_to_message_id": str(reply_to_message_id or ""),
                     "action": "send_plain_text",
                     "text": text,
@@ -154,10 +189,15 @@ class FeishuPushService:
         lines: list[str],
         template: str = "blue",
         reply_to_message_id: Optional[str] = None,
+        receive_id_type: Optional[str] = None,
+        receive_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         token = await self._get_tenant_access_token()
         if not token:
             return {"success": False, "message": "missing_feishu_credentials"}
+        target_type, target_id = self._normalize_receive_target(chat_id, receive_id_type, receive_id)
+        if not target_type or not target_id:
+            return {"success": False, "message": "missing_feishu_receive_target"}
 
         card = self._build_simple_card(title=title, lines=lines, template=template)
         url = f"{settings.FEISHU_BOT_API_BASE}/open-apis/im/v1/messages"
@@ -181,9 +221,9 @@ class FeishuPushService:
             if reply_target:
                 data = await _post("message_id", reply_target)
                 if data.get("code") != 0:
-                    data = await _post("chat_id", chat_id)
+                    data = await _post(target_type, target_id)
             else:
-                data = await _post("chat_id", chat_id)
+                data = await _post(target_type, target_id)
         except Exception as exc:
             data = {"code": -1, "msg": str(exc), "error_type": type(exc).__name__}
 
@@ -192,6 +232,8 @@ class FeishuPushService:
             await db.feishu_message_logs.insert_one(
                 {
                     "chat_id": chat_id,
+                    "receive_id_type": target_type,
+                    "receive_id": target_id,
                     "reply_to_message_id": str(reply_to_message_id or ""),
                     "action": "send_card",
                     "title": title,
@@ -211,10 +253,15 @@ class FeishuPushService:
         card: Dict[str, Any],
         action: str = "send_custom_card",
         reply_to_message_id: Optional[str] = None,
+        receive_id_type: Optional[str] = None,
+        receive_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         token = await self._get_tenant_access_token()
         if not token:
             return {"success": False, "message": "missing_feishu_credentials"}
+        target_type, target_id = self._normalize_receive_target(chat_id, receive_id_type, receive_id)
+        if not target_type or not target_id:
+            return {"success": False, "message": "missing_feishu_receive_target"}
 
         url = f"{settings.FEISHU_BOT_API_BASE}/open-apis/im/v1/messages"
         reply_target = str(reply_to_message_id or "").strip()
@@ -237,9 +284,9 @@ class FeishuPushService:
             if reply_target:
                 data = await _post("message_id", reply_target)
                 if data.get("code") != 0:
-                    data = await _post("chat_id", chat_id)
+                    data = await _post(target_type, target_id)
             else:
-                data = await _post("chat_id", chat_id)
+                data = await _post(target_type, target_id)
         except Exception as exc:
             data = {"code": -1, "msg": str(exc), "error_type": type(exc).__name__}
 
@@ -248,6 +295,8 @@ class FeishuPushService:
             await db.feishu_message_logs.insert_one(
                 {
                     "chat_id": chat_id,
+                    "receive_id_type": target_type,
+                    "receive_id": target_id,
                     "reply_to_message_id": str(reply_to_message_id or ""),
                     "action": action,
                     "card": card,

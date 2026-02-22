@@ -29,12 +29,14 @@ from app.services.feishu_nl_agent_service import feishu_nl_agent_service
 from app.services.favorites_service import favorites_service
 from app.services.foreign_stock_service import ForeignStockService
 from app.services.portfolio_service import portfolio_service
+from app.services.signals.store import SignalStore
 from app.services.simple_analysis_service import get_simple_analysis_service
 from app.routers.paper import LongportSyncRequest, sync_longport_positions as sync_paper_longport_positions
 from app.utils.timezone import to_config_tz
 
 router = APIRouter(prefix="/api/feishu", tags=["feishu"])
 logger = logging.getLogger(__name__)
+signal_store = SignalStore()
 REPORT_TEXT_MAX_CHARS = 100_000
 REPORT_SECTION_ORDER: List[Tuple[str, str]] = [
     ("final_trade_decision", "最终决策"),
@@ -3219,9 +3221,179 @@ async def _handle_screen_run_analysis_action(
     )
 
 
+def _signal_market_to_label(raw: str) -> str:
+    mk = str(raw or "").strip().upper()
+    if mk == "HK":
+        return "港股"
+    if mk == "US":
+        return "美股"
+    return "A股"
+
+
+def _normalize_signal_symbol_for_analysis(symbol: str, market_code: str) -> str:
+    mk = str(market_code or "").strip().upper()
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return ""
+    if mk == "HK":
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return f"{digits.zfill(5)}.HK" if digits else raw
+    if mk == "US":
+        return re.sub(r"\.US$", "", raw, flags=re.IGNORECASE)
+    if re.fullmatch(r"\d{1,6}", raw):
+        return raw.zfill(6)
+    if re.fullmatch(r"\d{6}\.(SH|SZ)", raw):
+        return raw.split(".", 1)[0]
+    return raw
+
+
+async def _load_signal_event_for_card_action(value: Dict[str, Any]) -> Dict[str, Any]:
+    event_id = str(value.get("event_id") or "").strip()
+    token = str(value.get("token") or "").strip()
+    if not event_id:
+        raise ValueError("缺少信号事件ID")
+
+    event = await signal_store.get_event_by_id(event_id)
+    if not event:
+        raise ValueError(f"未找到信号事件: {event_id}")
+
+    expected = str((event.get("action_tokens") or {}).get("card_action") or (event.get("action_tokens") or {}).get("analysis") or "")
+    if not expected or token != expected:
+        raise ValueError("信号操作凭证无效或已过期")
+    return event
+
+
+async def _handle_signal_ack_action(value: Dict[str, Any]) -> str:
+    event = await _load_signal_event_for_card_action(value)
+    event_id = str(event.get("event_id") or "")
+    owner_user_id = str(event.get("user_id") or "default")
+    ok_flag = await signal_store.ack_event(user_id=owner_user_id, event_id=event_id)
+    if not ok_flag:
+        raise ValueError("标记已读失败")
+    return f"已标记已读：{event.get('ticker')} · {event.get('rule_name')}"
+
+
+async def _handle_signal_mute_action(value: Dict[str, Any]) -> str:
+    event = await _load_signal_event_for_card_action(value)
+    event_id = str(event.get("event_id") or "")
+    owner_user_id = str(event.get("user_id") or "default")
+    days = int(value.get("days") or 7)
+    days = max(1, min(365, days))
+    ok_flag = await signal_store.mute_from_event(user_id=owner_user_id, event_id=event_id, days=days)
+    if not ok_flag:
+        raise ValueError("静默失败")
+    return f"已静默 {days} 天：{event.get('ticker')} · {event.get('rule_name')}"
+
+
+async def _handle_signal_show_detail_action(value: Dict[str, Any]) -> str:
+    event = await _load_signal_event_for_card_action(value)
+    snap = event.get("snapshot") or {}
+    evidence = event.get("evidence") or {}
+    matched = evidence.get("matched_conditions") or []
+    matched_text = "；".join([str(x) for x in matched[:4]]) if matched else "-"
+    analysis = event.get("analysis") or {}
+    analysis_task_id = str(analysis.get("task_id") or "").strip()
+
+    lines = [
+        f"信号详情：{event.get('ticker')} ({event.get('market')})",
+        f"规则：{event.get('rule_name')}  等级：{event.get('level')}",
+        f"价格/MA20/MA50/MA100: {snap.get('price')} / {snap.get('ma20')} / {snap.get('ma50')} / {snap.get('ma100')}",
+        f"RSI14={snap.get('rsi14')}  VOL比={snap.get('vol_ratio_20d')}  VWAP={snap.get('vwap')}",
+        f"命中条件：{matched_text}",
+        f"动作建议：{event.get('action_hint') or '-'}",
+    ]
+    if analysis_task_id:
+        lines.append(f"最近复盘任务ID：{analysis_task_id}")
+    return "\n".join(lines)
+
+
+async def _handle_signal_run_analysis_action(
+    *,
+    chat_id: str,
+    value: Dict[str, Any],
+) -> Tuple[str, bool]:
+    event = await _load_signal_event_for_card_action(value)
+    owner_user_id = str(event.get("user_id") or "default")
+    market_code = str(event.get("market") or "CN").strip().upper()
+    symbol = _normalize_signal_symbol_for_analysis(
+        symbol=str(event.get("ticker") or "").strip(),
+        market_code=market_code,
+    )
+    stock_name = str(value.get("stock_name") or value.get("name") or symbol).strip() or symbol
+    market = _signal_market_to_label(market_code)
+    research_depth = str(value.get("research_depth") or "标准")
+    return await _handle_screen_run_analysis_action(
+        user_id=owner_user_id,
+        chat_id=chat_id,
+        symbol=symbol,
+        stock_name=stock_name,
+        market=market,
+        research_depth=research_depth,
+    )
+
+
 async def handle_feishu_card_action_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     value = _extract_card_action_value(payload) or {}
     intent = str(value.get("intent") or "").strip()
+
+    if intent == "signal_show_detail":
+        chat_id = _extract_card_action_chat_id(payload)
+        try:
+            msg = await _handle_signal_show_detail_action(value)
+            if chat_id:
+                await feishu_push_service.send_text(chat_id, msg)
+            return {"toast": {"type": "success", "content": "已发送信号详情"}}
+        except Exception as exc:
+            if chat_id:
+                await feishu_push_service.send_text(chat_id, f"查看信号详情失败: {exc}")
+            return {"toast": {"type": "error", "content": "查看详情失败"}}
+
+    if intent == "signal_ack":
+        chat_id = _extract_card_action_chat_id(payload)
+        try:
+            msg = await _handle_signal_ack_action(value)
+            if chat_id:
+                await feishu_push_service.send_text(chat_id, msg)
+            return {"toast": {"type": "success", "content": "已标记已读"}}
+        except Exception as exc:
+            if chat_id:
+                await feishu_push_service.send_text(chat_id, f"标记已读失败: {exc}")
+            return {"toast": {"type": "error", "content": "标记已读失败"}}
+
+    if intent == "signal_mute":
+        chat_id = _extract_card_action_chat_id(payload)
+        try:
+            msg = await _handle_signal_mute_action(value)
+            if chat_id:
+                await feishu_push_service.send_text(chat_id, msg)
+            return {"toast": {"type": "success", "content": "已静默信号"}}
+        except Exception as exc:
+            if chat_id:
+                await feishu_push_service.send_text(chat_id, f"静默信号失败: {exc}")
+            return {"toast": {"type": "error", "content": "静默失败"}}
+
+    if intent == "signal_run_analysis":
+        chat_id = _extract_card_action_chat_id(payload)
+        actor_user_id = _extract_card_action_user_id(payload)
+        if not chat_id:
+            return {"toast": {"type": "error", "content": "缺少会话ID"}}
+        try:
+            reply, already_sent = await _handle_signal_run_analysis_action(
+                chat_id=chat_id,
+                value=value,
+            )
+            if chat_id and not already_sent:
+                await feishu_push_service.send_text(chat_id, reply)
+            await _upsert_conversation(
+                conversation_id=f"chat:{chat_id}:user:{actor_user_id}",
+                user_id=actor_user_id,
+                chat_id=chat_id,
+                push_turn={"role": "assistant", "content": reply, "ts": datetime.utcnow().isoformat()},
+            )
+            return {"toast": {"type": "success", "content": "已启动分析任务"}}
+        except Exception as exc:
+            await feishu_push_service.send_text(chat_id, f"启动分析失败: {exc}")
+            return {"toast": {"type": "error", "content": "启动分析失败"}}
 
     if intent == "screen_add_watchlist":
         chat_id = _extract_card_action_chat_id(payload)
@@ -3367,11 +3539,13 @@ async def _resolve_stock_for_analysis(
     m_hk_pref = re.fullmatch(r"(?i)hk[\s\-_\.]*([0-9]{1,5})", q_clean)
     if m_hk_pref:
         digits = m_hk_pref.group(1).zfill(5)
-        return f"{digits}.HK", f"{digits}.HK", market_type or "港股"
+        # 显式 hk 前缀优先级最高，避免被错误的 market_hint 覆盖
+        return f"{digits}.HK", f"{digits}.HK", "港股"
     m_us_pref = re.fullmatch(r"(?i)us[\s\-_\.]*([A-Z][A-Z0-9.\-]{0,9})", q_clean)
     if m_us_pref:
         sym = m_us_pref.group(1).upper().replace(".US", "")
-        return sym, sym, market_type or "美股"
+        # 显式 us 前缀优先级最高，避免被错误的 market_hint 覆盖
+        return sym, sym, "美股"
 
     if re.fullmatch(r"\d{6}", q_clean):
         symbol, name = await _resolve_a_share_symbol(q_clean)
@@ -3403,7 +3577,8 @@ async def _resolve_stock_for_analysis(
     if re.fullmatch(r"[A-Za-z0-9]+\\.(HK|US|SH|SZ)", q_clean, flags=re.IGNORECASE):
         suffix = q_clean.split(".")[-1].upper()
         inferred_market = "港股" if suffix == "HK" else ("美股" if suffix == "US" else "A股")
-        return q_clean.upper(), q_clean.upper(), market_type or inferred_market
+        # 显式市场后缀优先级高于 hint
+        return q_clean.upper(), q_clean.upper(), inferred_market
 
     # 按名称查询
     db = get_mongo_db()

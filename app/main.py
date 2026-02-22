@@ -41,6 +41,7 @@ from app.routers import a_share_sqlite as a_share_sqlite_router
 from app.routers import notifications as notifications_router
 from app.routers import websocket_notifications as websocket_notifications_router
 from app.routers import scheduler as scheduler_router
+from app.routers import signals as signals_router
 from app.services.basics_sync_service import get_basics_sync_service
 from app.services.multi_source_basics_sync_service import MultiSourceBasicsSyncService
 from app.services.scheduler_service import set_scheduler_instance
@@ -82,10 +83,17 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from app.services.quotes_ingestion_service import QuotesIngestionService
 from app.services.market_push_schedule_service import market_push_schedule_service
+from app.services.signals.scanner import (
+    signal_scanner,
+    DEFAULT_SIGNALS_USER_ID,
+    DEFAULT_SIGNALS_RULES_GLOB,
+)
 from app.services.feishu_stream_service import feishu_stream_service
 from app.services.simple_analysis_service import get_simple_analysis_service
 from app.services.analysis_feedback_service import get_analysis_feedback_service
 from app.routers import paper as paper_router
+
+DEFAULT_SIGNALS_SCAN_INTERVAL_SECONDS = 300
 
 
 def get_version() -> str:
@@ -770,6 +778,31 @@ async def lifespan(app: FastAPI):
                 f"🕒 分市场投研推送扫描器已启动: 每{settings.MARKET_PUSH_SCAN_INTERVAL_SECONDS}秒扫描"
             )
 
+        # 规则信号扫描任务（P0）
+        async def run_signals_rule_scan():
+            try:
+                await signal_scanner.scan_once(
+                    user_id=DEFAULT_SIGNALS_USER_ID,
+                    force=False,
+                    rules_glob=DEFAULT_SIGNALS_RULES_GLOB,
+                )
+            except Exception as e:
+                logger.error(f"❌ 规则信号扫描失败: {e}", exc_info=True)
+
+        scheduler.add_job(
+            run_signals_rule_scan,
+            IntervalTrigger(seconds=DEFAULT_SIGNALS_SCAN_INTERVAL_SECONDS, timezone=settings.TIMEZONE),
+            id="signals_rule_scan",
+            name="规则信号扫描器",
+        )
+        if not settings.SIGNALS_ENABLED:
+            scheduler.pause_job("signals_rule_scan")
+            logger.info("⏸️ 规则信号扫描器已添加但暂停")
+        else:
+            logger.info(
+                f"📶 规则信号扫描器已启动: 每{DEFAULT_SIGNALS_SCAN_INTERVAL_SECONDS}秒扫描, 用户={DEFAULT_SIGNALS_USER_ID}"
+            )
+
         # 分析任务僵尸清理任务（长时间 running/pending 自动失败）
         async def run_analysis_zombie_cleanup():
             try:
@@ -998,6 +1031,7 @@ app.include_router(websocket_notifications_router.router, prefix="/api", tags=["
 
 # 定时任务管理
 app.include_router(scheduler_router.router, tags=["scheduler"])
+app.include_router(signals_router.router, tags=["signals"])
 
 app.include_router(sse.router, prefix="/api/stream", tags=["streaming"])
 app.include_router(sync_router.router)

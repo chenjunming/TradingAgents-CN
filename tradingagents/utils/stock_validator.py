@@ -1139,22 +1139,36 @@ class StockDataPreparer:
             # 1. 获取历史数据（美股通常直接通过历史数据验证股票是否存在）
             logger.debug(f"📊 [美股数据] 获取{formatted_code}历史数据 ({start_date_str} 到 {end_date_str})...")
 
-            # 导入美股数据提供器（支持新旧路径）
+            # 优先走统一市场接口（可按配置优先使用 LongPort，再回退 yfinance/finnhub）
+            historical_data = None
             try:
-                from tradingagents.dataflows.providers.us import OptimizedUSDataProvider
-                provider = OptimizedUSDataProvider()
-                historical_data = provider.get_stock_data(
+                from tradingagents.dataflows.interface import get_stock_data_by_market
+                historical_data = get_stock_data_by_market(
                     formatted_code,
                     start_date_str,
-                    end_date_str
+                    end_date_str,
                 )
-            except ImportError:
-                from tradingagents.dataflows.providers.us.optimized import get_us_stock_data_cached
-                historical_data = get_us_stock_data_cached(
-                    formatted_code,
-                    start_date_str,
-                    end_date_str
-                )
+                logger.info(f"🔁 [美股数据] 已通过统一接口尝试获取: {formatted_code}")
+            except Exception as unified_exc:
+                logger.warning(f"⚠️ [美股数据] 统一接口获取失败，回退旧链路: {unified_exc}")
+
+            # 统一接口失败时，回退旧的优化 provider 链路
+            if not historical_data or "❌" in str(historical_data) or "错误" in str(historical_data) or "无法获取" in str(historical_data):
+                try:
+                    from tradingagents.dataflows.providers.us import OptimizedUSDataProvider
+                    provider = OptimizedUSDataProvider()
+                    historical_data = provider.get_stock_data(
+                        formatted_code,
+                        start_date_str,
+                        end_date_str
+                    )
+                except ImportError:
+                    from tradingagents.dataflows.providers.us.optimized import get_us_stock_data_cached
+                    historical_data = get_us_stock_data_cached(
+                        formatted_code,
+                        start_date_str,
+                        end_date_str
+                    )
 
             if historical_data and "❌" not in historical_data and "错误" not in historical_data and "无法获取" not in historical_data:
                 # 更宽松的数据有效性检查

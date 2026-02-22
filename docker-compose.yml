@@ -15,11 +15,13 @@ services:
       - "8000:8000"
     volumes:
       # 日志目录映射
-      - ./logs:/app/logs
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/logs:/app/logs
       # 配置目录映射
       - ./config:/app/config
+      # 信号规则目录映射
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/rules:/app/rules:ro
       # 数据目录映射
-      - ./data:/app/data
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/data:/app/data
     env_file:
       - .env
     environment:
@@ -205,4 +207,3 @@ networks:
   tradingagents-network:
     driver: bridge
     name: tradingagents-network
-

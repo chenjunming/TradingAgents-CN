@@ -74,13 +74,13 @@ services:
     expose:
       - "8000"
     volumes:
-      - ./logs:/app/logs
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/logs:/app/logs
       # 不映射config目录，使用镜像内的配置文件
       # 如需修改配置，请修改代码后重新构建镜像
       # - ./config:/app/config
-      - ./data:/app/data
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/data:/app/data
     env_file:
-      - .env
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/.env
     environment:
       TZ: "Asia/Shanghai"
       TRADINGAGENTS_LOG_LEVEL: "INFO"
@@ -181,7 +181,7 @@ services:
     ports:
       - "80:80" 
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - /tmp/zfsv3/sata11/13265178248/data/docker/TradingAgents-CN/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - frontend
       - backend
@@ -203,4 +203,3 @@ volumes:
 networks:
   tradingagents-network:
     driver: bridge
-

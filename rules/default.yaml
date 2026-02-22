@@ -1,0 +1,264 @@
+rules:
+  - id: ma50_reclaim_breakout
+    name: 回踩/站回MA50 + 放量确认
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: cross_above
+        left: close
+        right: ma50
+      - op: gte
+        left: vol_ratio_20d
+        right: 1.5
+    confirm:
+      - op: gte
+        left: rsi14
+        right: 55
+    risk:
+      - op: cross_below
+        left: close
+        right: ma50
+    cooldown_minutes: 120
+    level_on_match: prewarn
+    notify:
+      template: default_signal_card
+    action_hint: 可考虑分批建仓，若放量跌回MA50且不能收复则降级处理。
+
+  - id: ma20_ma50_golden_cross
+    name: MA20上穿MA50（趋势增强）
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: cross_above
+        left: ma20
+        right: ma50
+      - op: gte
+        left: close
+        right: ma20
+      - op: gte
+        left: vol_ratio_20d
+        right: 1.2
+    confirm:
+      - op: trend_up
+        left: ma50
+        right: 5
+    risk:
+      - op: cross_below
+        left: ma20
+        right: ma50
+    cooldown_minutes: 240
+    level_on_match: prewarn
+    notify:
+      template: default_signal_card
+    action_hint: 趋势转强信号，优先等待回踩不破再加仓。
+
+  - id: box_breakout_20d_high
+    name: 20日新高突破 + 放量
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: new_high_n
+        left: close
+        right: 20
+      - op: gte
+        left: vol_ratio_20d
+        right: 1.5
+    confirm:
+      - op: gte
+        left: rsi14
+        right: 55
+    cooldown_minutes: 240
+    level_on_match: confirm
+    notify:
+      template: default_signal_card
+    action_hint: 突破后若量能延续，可按趋势策略持有。
+
+  - id: trend_stack_bull_confirm
+    name: 多头排列 + 趋势向上
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: gte
+        left: close
+        right: ma20
+      - op: gte
+        left: ma20
+        right: ma50
+      - op: gte
+        left: ma50
+        right: ma100
+      - op: trend_up
+        left: ma50
+        right: 5
+    confirm:
+      - op: gte
+        left: rsi14
+        right: 55
+    cooldown_minutes: 360
+    level_on_match: prewarn
+    notify:
+      template: default_signal_card
+    action_hint: 多头结构完整，适合趋势跟随而非追高重仓。
+
+  - id: pullback_to_ma20_in_uptrend
+    name: 上升趋势中回踩MA20
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: trend_up
+        left: ma50
+        right: 5
+      - op: within_pct
+        left: close
+        right: ma20
+        pct: 1.5
+      - op: between
+        left: rsi14
+        right: [45, 60]
+    confirm:
+      - op: cross_above
+        left: close
+        right: ma20
+    cooldown_minutes: 180
+    level_on_match: prewarn
+    notify:
+      template: default_signal_card
+    action_hint: 适合做“回踩确认”的二次入场，跌破MA20需控制仓位。
+
+  - id: vwap_reclaim_with_volume
+    name: 重回VWAP + 放量
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: cross_above
+        left: close
+        right: vwap
+      - op: gte
+        left: vol_ratio_20d
+        right: 1.5
+    confirm:
+      - op: gte
+        left: close
+        right: ma20
+    cooldown_minutes: 120
+    level_on_match: prewarn
+    notify:
+      template: default_signal_card
+    action_hint: 资金重新占优，优先结合趋势方向过滤噪音。
+
+  - id: oversold_rebound_signal
+    name: 超卖反弹启动
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: lte
+        left: rsi14
+        right: 35
+      - op: cross_above
+        left: close
+        right: ma20
+      - op: gte
+        left: vol_ratio_20d
+        right: 1.1
+    cooldown_minutes: 180
+    level_on_match: prewarn
+    notify:
+      template: default_signal_card
+    action_hint: 反弹型信号，优先小仓位试错并设置失效位。
+
+  - id: rsi_overheat_risk
+    name: RSI过热风险
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: gte
+        left: rsi14
+        right: 75
+      - op: lte
+        left: vol_ratio_20d
+        right: 1.0
+    cooldown_minutes: 120
+    level_on_match: risk
+    notify:
+      template: default_signal_card
+    action_hint: 动能过热且量能不跟随，警惕冲高回落风险。
+
+  - id: box_breakdown_20d_low_risk
+    name: 20日新低跌破风险
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: new_low_n
+        left: close
+        right: 20
+      - op: gte
+        left: vol_ratio_20d
+        right: 1.3
+    cooldown_minutes: 180
+    level_on_match: risk
+    notify:
+      template: default_signal_card
+    action_hint: 破位信号优先防守，等待重新站回关键均线再评估。
+
+  - id: ma20_breakdown_risk
+    name: 跌破MA20 + 短期转弱
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: cross_below
+        left: close
+        right: ma20
+      - op: trend_down
+        left: close
+        right: 5
+    cooldown_minutes: 120
+    level_on_match: risk
+    notify:
+      template: default_signal_card
+    action_hint: 若无法快速收复MA20，短线风格建议降低风险暴露。
+
+  - id: ma20_ma50_dead_cross_risk
+    name: MA20下穿MA50（趋势转弱）
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: cross_below
+        left: ma20
+        right: ma50
+      - op: lte
+        left: rsi14
+        right: 45
+    cooldown_minutes: 240
+    level_on_match: risk
+    notify:
+      template: default_signal_card
+    action_hint: 中短期趋势转弱，优先控制回撤并等待结构修复。
+
+  - id: ma50_breakdown_risk
+    name: 跌破MA50 风险提示
+    timeframe: 1d
+    applies_to:
+      markets: [CN, HK, US]
+    conditions:
+      - op: cross_below
+        left: close
+        right: ma50
+      - op: gte
+        left: vol_ratio_20d
+        right: 1.2
+    cooldown_minutes: 120
+    level_on_match: risk
+    notify:
+      template: default_signal_card
+    action_hint: 若当日无法收复MA50，优先控制回撤风险。

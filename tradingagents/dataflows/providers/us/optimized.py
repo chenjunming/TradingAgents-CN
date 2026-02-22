@@ -94,6 +94,7 @@ class OptimizedUSDataProvider:
 
             # 数据源名称映射
             source_name_mapping = {
+                USDataSource.LONGPORT: "longport",
                 USDataSource.ALPHA_VANTAGE: "alpha_vantage",
                 USDataSource.YFINANCE: "yfinance",
                 USDataSource.FINNHUB: "finnhub",
@@ -155,6 +156,9 @@ class OptimizedUSDataProvider:
                     formatted_data = self._get_data_from_alpha_vantage(symbol, start_date, end_date)
                 elif source_name == 'yfinance':
                     formatted_data = self._get_data_from_yfinance(symbol, start_date, end_date)
+                elif source_name == 'longport':
+                    from tradingagents.dataflows.providers.hk.improved_hk import get_stock_data_longport_unified
+                    formatted_data = get_stock_data_longport_unified(symbol, start_date, end_date)
                 else:
                     logger.warning(f"⚠️ 未知的数据源类型: {source_name}")
                     continue

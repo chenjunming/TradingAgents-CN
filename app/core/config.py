@@ -179,6 +179,10 @@ class Settings(BaseSettings):
     FEISHU_BOT_ENCRYPT_KEY: str = Field(default="")
     FEISHU_BOT_DEFAULT_CHAT_ID: str = Field(default="")
     FEISHU_BOT_API_BASE: str = Field(default="https://open.feishu.cn")
+    # 信号推送目标（单用户场景建议直接配置）
+    # receive_id_type: chat_id | open_id | user_id | union_id
+    FEISHU_SIGNAL_RECEIVE_ID_TYPE: str = Field(default="open_id")
+    FEISHU_SIGNAL_RECEIVE_ID: str = Field(default="")
     FEISHU_ANALYSIS_PROGRESS_POLL_SECONDS: int = Field(default=6, ge=2, le=60)
     FEISHU_ANALYSIS_PROGRESS_MIN_PUSH_INTERVAL_SECONDS: int = Field(default=15, ge=3, le=300)
     FEISHU_ANALYSIS_PROGRESS_MIN_INCREMENT: int = Field(default=10, ge=1, le=50)
@@ -191,6 +195,8 @@ class Settings(BaseSettings):
     MARKET_PUSH_WINDOW_SECONDS: int = Field(default=90, ge=10, le=600)
     MARKET_PUSH_MARKETS: str = Field(default="CN,HK,US")
     MARKET_PUSH_EXPOSURE_ONLY: bool = Field(default=True)
+    SIGNALS_ENABLED: bool = Field(default=True)
+    SIGNALS_RESPECT_MARKET_HOURS: bool = Field(default=True)
     ANALYSIS_ZOMBIE_CLEANUP_ENABLED: bool = Field(default=True)
     ANALYSIS_ZOMBIE_CLEANUP_RUN_ON_STARTUP: bool = Field(default=True)
     ANALYSIS_ZOMBIE_CLEANUP_INTERVAL_MINUTES: int = Field(default=30, ge=5, le=1440)

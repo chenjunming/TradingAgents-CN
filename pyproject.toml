@@ -33,6 +33,7 @@ dependencies = [
     "httpx>=0.24.0",
     "sse-starlette>=1.0.0",
     "exchange-calendars>=4.5.0",
+    "PyYAML>=6.0.0",
 
     # 日志处理
     "concurrent-log-handler>=0.9.24",  # Windows 友好的日志轮转处理器

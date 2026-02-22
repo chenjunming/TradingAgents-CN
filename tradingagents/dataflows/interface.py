@@ -165,6 +165,36 @@ def _get_enabled_us_data_sources() -> list:
     Returns:
         list: 按优先级排序的数据源列表，如 ['yfinance', 'finnhub']
     """
+    # 0) 环境变量强制覆盖（最高优先级，适用于无法修改数据库的部署）
+    # 例如：
+    # TA_US_ENABLED_SOURCES=longport,yfinance
+    # TA_US_SOURCE_PRIORITY=longport,yfinance
+    def _normalize_source(name: str) -> str:
+        key = str(name or "").strip().lower().replace("-", "_")
+        mapping = {
+            "longport": "longport",
+            "yfinance": "yfinance",
+            "yahoo_finance": "yfinance",
+            "yahoo finance": "yfinance",
+            "finnhub": "finnhub",
+            "alpha_vantage": "alpha_vantage",
+            "alpha vantage": "alpha_vantage",
+        }
+        return mapping.get(key, key)
+
+    env_enabled = os.getenv("TA_US_ENABLED_SOURCES")
+    env_priority = os.getenv("TA_US_SOURCE_PRIORITY")
+    if env_enabled or env_priority:
+        enabled = [_normalize_source(x) for x in (env_enabled or "").split(",") if x.strip()] or ['longport', 'yfinance', 'finnhub']
+        priority = [_normalize_source(x) for x in (env_priority or "").split(",") if x.strip()]
+        ordered = [x for x in priority if x in enabled] + [x for x in enabled if x not in priority]
+        ordered = [x for x in ordered if x in ['longport', 'yfinance', 'finnhub']]
+        if _has_longport_credentials() and 'longport' in enabled and 'longport' not in ordered:
+            ordered = ['longport'] + ordered
+        if ordered:
+            logger.info(f"✅ [美股数据源] 从环境变量读取: {ordered}")
+            return ordered
+
     try:
         # 尝试从数据库读取配置
         from app.core.database import get_mongo_db_sync
@@ -1260,6 +1290,18 @@ def get_fundamentals_finnhub(ticker, curr_date):
     try:
         import finnhub
         import os
+        def fmt_num(value, suffix: str = "", precision: int = 2) -> str:
+            """安全格式化数值，避免 None/非法值触发格式化异常。"""
+            try:
+                if value is None:
+                    return "N/A"
+                if isinstance(value, str) and not value.strip():
+                    return "N/A"
+                num = float(value)
+                return f"{num:.{precision}f}{suffix}"
+            except Exception:
+                return "N/A"
+
         # 导入缓存管理器（统一入口）
         from .cache import get_cache
         cache = get_cache()
@@ -1325,25 +1367,25 @@ def get_fundamentals_finnhub(ticker, curr_date):
             
             # 估值指标
             if 'peBasicExclExtraTTM' in metrics:
-                report += f"| 市盈率 (PE) | {metrics['peBasicExclExtraTTM']:.2f} |\n"
+                report += f"| 市盈率 (PE) | {fmt_num(metrics.get('peBasicExclExtraTTM'))} |\n"
             if 'psAnnual' in metrics:
-                report += f"| 市销率 (PS) | {metrics['psAnnual']:.2f} |\n"
+                report += f"| 市销率 (PS) | {fmt_num(metrics.get('psAnnual'))} |\n"
             if 'pbAnnual' in metrics:
-                report += f"| 市净率 (PB) | {metrics['pbAnnual']:.2f} |\n"
-            
+                report += f"| 市净率 (PB) | {fmt_num(metrics.get('pbAnnual'))} |\n"
+
             # 盈利能力指标
             if 'roeTTM' in metrics:
-                report += f"| 净资产收益率 (ROE) | {metrics['roeTTM']:.2f}% |\n"
+                report += f"| 净资产收益率 (ROE) | {fmt_num(metrics.get('roeTTM'), suffix='%')} |\n"
             if 'roaTTM' in metrics:
-                report += f"| 总资产收益率 (ROA) | {metrics['roaTTM']:.2f}% |\n"
+                report += f"| 总资产收益率 (ROA) | {fmt_num(metrics.get('roaTTM'), suffix='%')} |\n"
             if 'netProfitMarginTTM' in metrics:
-                report += f"| 净利润率 | {metrics['netProfitMarginTTM']:.2f}% |\n"
-            
+                report += f"| 净利润率 | {fmt_num(metrics.get('netProfitMarginTTM'), suffix='%')} |\n"
+
             # 财务健康指标
             if 'currentRatioAnnual' in metrics:
-                report += f"| 流动比率 | {metrics['currentRatioAnnual']:.2f} |\n"
+                report += f"| 流动比率 | {fmt_num(metrics.get('currentRatioAnnual'))} |\n"
             if 'totalDebt/totalEquityAnnual' in metrics:
-                report += f"| 负债权益比 | {metrics['totalDebt/totalEquityAnnual']:.2f} |\n"
+                report += f"| 负债权益比 | {fmt_num(metrics.get('totalDebt/totalEquityAnnual'))} |\n"
             
             report += "\n"
         

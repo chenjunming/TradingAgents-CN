@@ -17,6 +17,9 @@ DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-chenjunming123}"
 VERSION="${VERSION:-$(cat VERSION 2>/dev/null || echo v1.0.0-preview)}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 BUILDER_NAME="${BUILDER_NAME:-tradingagents-builder}"
+CACHE_ENABLED="${CACHE_ENABLED:-true}"
+CACHE_MODE="${CACHE_MODE:-max}"
+CACHE_IMAGE="${CACHE_IMAGE:-${DOCKERHUB_USERNAME}/tradingagents-buildcache}"
 
 echo "========================================"
 echo "TradingAgents-CN Docker Hub 发布"
@@ -24,6 +27,8 @@ echo "========================================"
 echo "Docker Hub 用户: ${DOCKERHUB_USERNAME}"
 echo "版本: ${VERSION}"
 echo "平台: ${PLATFORMS}"
+echo "缓存开关: ${CACHE_ENABLED}"
+echo "缓存镜像: ${CACHE_IMAGE}"
 echo
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -49,23 +54,34 @@ docker buildx inspect --bootstrap >/dev/null
 BACKEND_IMAGE="${DOCKERHUB_USERNAME}/tradingagents-backend"
 FRONTEND_IMAGE="${DOCKERHUB_USERNAME}/tradingagents-frontend"
 
+build_and_push() {
+  local dockerfile="$1"
+  local image="$2"
+  local cache_ref="$3"
+
+  local -a cache_args=()
+  if [ "${CACHE_ENABLED}" = "true" ]; then
+    cache_args=(
+      --cache-from "type=registry,ref=${CACHE_IMAGE}:${cache_ref}"
+      --cache-to "type=registry,ref=${CACHE_IMAGE}:${cache_ref},mode=${CACHE_MODE}"
+    )
+  fi
+
+  docker buildx build \
+    --platform "${PLATFORMS}" \
+    -f "${dockerfile}" \
+    -t "${image}:${VERSION}" \
+    -t "${image}:latest" \
+    "${cache_args[@]}" \
+    --push \
+    .
+}
+
 echo "[3/4] 构建并推送后端镜像..."
-docker buildx build \
-  --platform "${PLATFORMS}" \
-  -f Dockerfile.backend \
-  -t "${BACKEND_IMAGE}:${VERSION}" \
-  -t "${BACKEND_IMAGE}:latest" \
-  --push \
-  .
+build_and_push "Dockerfile.backend" "${BACKEND_IMAGE}" "backend-cache"
 
 echo "[4/4] 构建并推送前端镜像..."
-docker buildx build \
-  --platform "${PLATFORMS}" \
-  -f Dockerfile.frontend \
-  -t "${FRONTEND_IMAGE}:${VERSION}" \
-  -t "${FRONTEND_IMAGE}:latest" \
-  --push \
-  .
+build_and_push "Dockerfile.frontend" "${FRONTEND_IMAGE}" "frontend-cache"
 
 echo
 echo "发布完成:"

@@ -29,6 +29,25 @@ class MarketSessionTimes:
 
 class MarketCalendarService:
     @staticmethod
+    def _is_open_in_fallback_window(market: str, now_local: datetime) -> bool:
+        if now_local.weekday() > 4:
+            return False
+        t = now_local.time()
+
+        if market == "CN":
+            # A股：09:30-11:30, 13:00-15:00
+            return ((t.hour, t.minute) >= (9, 30) and (t.hour, t.minute) < (11, 30)) or (
+                (t.hour, t.minute) >= (13, 0) and (t.hour, t.minute) < (15, 0)
+            )
+        if market == "HK":
+            # 港股：09:30-12:00, 13:00-16:00
+            return ((t.hour, t.minute) >= (9, 30) and (t.hour, t.minute) < (12, 0)) or (
+                (t.hour, t.minute) >= (13, 0) and (t.hour, t.minute) < (16, 0)
+            )
+        # 美股（常规时段）：09:30-16:00（纽约本地时间）
+        return (t.hour, t.minute) >= (9, 30) and (t.hour, t.minute) < (16, 0)
+
+    @staticmethod
     def _get_calendar(market: str):
         import exchange_calendars as xcals
         return xcals.get_calendar(MARKET_TO_CALENDAR[market])
@@ -78,6 +97,22 @@ class MarketCalendarService:
             return cal.is_session(d)
         except Exception:
             return d.weekday() < 5
+
+    def is_market_open(self, market: str, ref_dt: datetime | None = None) -> bool:
+        market = market.upper()
+        tz_name = MARKET_TO_TZ[market]
+        tz = ZoneInfo(tz_name)
+        now_local = ref_dt.astimezone(tz) if ref_dt else datetime.now(tz)
+
+        try:
+            import pandas as pd
+
+            cal = self._get_calendar(market)
+            now_utc = now_local.astimezone(ZoneInfo("UTC"))
+            minute = pd.Timestamp(now_utc).floor("min")
+            return bool(cal.is_open_on_minute(minute))
+        except Exception:
+            return self._is_open_in_fallback_window(market, now_local)
 
     def today_push_times(self, market: str, ref_dt: datetime | None = None) -> dict[str, datetime]:
         session = self.get_session_times(market, ref_dt=ref_dt)

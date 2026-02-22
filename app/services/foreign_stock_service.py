@@ -55,6 +55,33 @@ class ForeignStockService:
         self._pending_requests = {}
 
         logger.info("✅ ForeignStockService 初始化完成（已启用请求去重）")
+
+    @staticmethod
+    def _normalize_source_name(source_name: str) -> str:
+        s = str(source_name or "").strip().lower()
+        s = s.replace("-", "_").replace(" ", "_")
+        s = re.sub(r"_+", "_", s)
+
+        alias_map = {
+            "yahoo_finance": "yfinance",
+            "yahoofinance": "yfinance",
+            "yahoo": "yfinance",
+            "alpha_vantage": "alpha_vantage",
+            "alphavantage": "alpha_vantage",
+            "longbridge": "longport",
+            "long_bridge": "longport",
+        }
+        return alias_map.get(s, s)
+
+    def _resolve_valid_sources(self, source_priority: List[str], source_handlers: Dict[str, Tuple[str, object]]) -> List[str]:
+        valid_keys: List[str] = []
+        seen = set()
+        for source_name in source_priority:
+            source_key = self._normalize_source_name(source_name)
+            if source_key in source_handlers and source_key not in seen:
+                seen.add(source_key)
+                valid_keys.append(source_key)
+        return valid_keys
     
     async def get_quote(self, market: str, code: str, force_refresh: bool = False) -> Dict:
         """
@@ -186,28 +213,19 @@ class ForeignStockService:
             # 🔥 只有这些是有效的数据源名称
             source_handlers = {
                 'yfinance': ('yfinance', self._get_hk_quote_from_yfinance),
-                'yahoo_finance': ('yfinance', self._get_hk_quote_from_yfinance),
                 'akshare': ('akshare', self._get_hk_quote_from_akshare),
             }
 
             # 过滤有效数据源并去重
-            valid_priority = []
-            seen = set()
-            for source_name in source_priority:
-                source_key = source_name.lower()
-                # 只保留有效的数据源
-                if source_key in source_handlers and source_key not in seen:
-                    seen.add(source_key)
-                    valid_priority.append(source_name)
+            valid_priority = self._resolve_valid_sources(source_priority, source_handlers)
 
             if not valid_priority:
                 logger.warning(f"⚠️ 数据库中没有配置有效的港股数据源，使用默认顺序")
-                valid_priority = ['yahoo_finance', 'akshare']
+                valid_priority = ['yfinance', 'akshare']
 
             logger.info(f"📊 [HK有效数据源] {valid_priority} (股票: {code})")
 
-            for source_name in valid_priority:
-                source_key = source_name.lower()
+            for source_key in valid_priority:
                 handler_name, handler_func = source_handlers[source_key]
                 try:
                     # 🔥 使用 asyncio.to_thread 避免阻塞事件循环
@@ -218,7 +236,7 @@ class ForeignStockService:
                         logger.info(f"✅ {data_source}获取港股行情成功: {code}")
                         break
                 except Exception as e:
-                    logger.warning(f"⚠️ {source_name}获取失败 ({code}): {e}")
+                    logger.warning(f"⚠️ {source_key}获取失败 ({code}): {e}")
                     continue
 
             if not quote_data:
@@ -251,16 +269,28 @@ class ForeignStockService:
         market_category_id = market_category_map.get(market)
 
         try:
-            # 从 datasource_groupings 集合查询
-            groupings = await self.db.datasource_groupings.find({
-                "market_category_id": market_category_id,
-                "enabled": True
-            }).sort("priority", -1).to_list(length=None)
+            if self.db is not None:
+                # 从 datasource_groupings 集合查询；兼容 async/sync 游标
+                cursor = self.db.datasource_groupings.find({
+                    "market_category_id": market_category_id,
+                    "enabled": True
+                })
+                try:
+                    cursor = cursor.sort("priority", -1)
+                except TypeError:
+                    if isinstance(cursor, list):
+                        cursor = sorted(cursor, key=lambda x: x.get("priority", 0), reverse=True)
 
-            if groupings:
-                priority_list = [g["data_source_name"] for g in groupings]
-                logger.info(f"📊 [{market}数据源优先级] 从数据库读取: {priority_list}")
-                return priority_list
+                if hasattr(cursor, "to_list"):
+                    maybe_groupings = cursor.to_list(length=None)
+                    groupings = await maybe_groupings if asyncio.iscoroutine(maybe_groupings) else maybe_groupings
+                else:
+                    groupings = list(cursor)
+
+                if groupings:
+                    priority_list = [str(g.get("data_source_name") or "") for g in groupings if g.get("data_source_name")]
+                    logger.info(f"📊 [{market}数据源优先级] 从数据库读取: {priority_list}")
+                    return priority_list
         except Exception as e:
             logger.warning(f"⚠️ [{market}数据源优先级] 从数据库读取失败: {e}，使用默认顺序")
 
@@ -358,28 +388,19 @@ class ForeignStockService:
             source_handlers = {
                 'alpha_vantage': ('alpha_vantage', self._get_us_quote_from_alpha_vantage),
                 'yfinance': ('yfinance', self._get_us_quote_from_yfinance),
-                'yahoo_finance': ('yfinance', self._get_us_quote_from_yfinance),
                 'finnhub': ('finnhub', self._get_us_quote_from_finnhub),
             }
 
             # 过滤有效数据源并去重
-            valid_priority = []
-            seen = set()
-            for source_name in source_priority:
-                source_key = source_name.lower()
-                # 只保留有效的数据源
-                if source_key in source_handlers and source_key not in seen:
-                    seen.add(source_key)
-                    valid_priority.append(source_name)
+            valid_priority = self._resolve_valid_sources(source_priority, source_handlers)
 
             if not valid_priority:
                 logger.warning("⚠️ 数据库中没有配置有效的美股数据源，使用默认顺序")
-                valid_priority = ['yahoo_finance', 'alpha_vantage', 'finnhub']
+                valid_priority = ['yfinance', 'alpha_vantage', 'finnhub']
 
             logger.info(f"📊 [US有效数据源] {valid_priority} (股票: {code})")
 
-            for source_name in valid_priority:
-                source_key = source_name.lower()
+            for source_key in valid_priority:
                 handler_name, handler_func = source_handlers[source_key]
                 try:
                     # 🔥 使用 asyncio.to_thread 避免阻塞事件循环
@@ -390,7 +411,7 @@ class ForeignStockService:
                         logger.info(f"✅ {data_source}获取美股行情成功: {code}")
                         break
                 except Exception as e:
-                    logger.warning(f"⚠️ {source_name}获取失败 ({code}): {e}")
+                    logger.warning(f"⚠️ {source_key}获取失败 ({code}): {e}")
                     continue
 
             if not quote_data:
@@ -804,27 +825,20 @@ class ForeignStockService:
         # 数据源名称映射
         source_handlers = {
             'akshare': ('akshare', self._get_hk_kline_from_akshare),
-            'yahoo_finance': ('yfinance', self._get_hk_kline_from_yfinance),
+            'yfinance': ('yfinance', self._get_hk_kline_from_yfinance),
             'finnhub': ('finnhub', self._get_hk_kline_from_finnhub),
         }
 
         # 过滤有效数据源并去重
-        valid_priority = []
-        seen = set()
-        for source_name in source_priority:
-            source_key = source_name.lower()
-            if source_key in source_handlers and source_key not in seen:
-                seen.add(source_key)
-                valid_priority.append(source_name)
+        valid_priority = self._resolve_valid_sources(source_priority, source_handlers)
 
         if not valid_priority:
             logger.warning("⚠️ 数据库中没有配置有效的港股K线数据源，使用默认顺序")
-            valid_priority = ['akshare', 'yahoo_finance', 'finnhub']
+            valid_priority = ['akshare', 'yfinance', 'finnhub']
 
         logger.info(f"📊 [HK K线有效数据源] {valid_priority}")
 
-        for source_name in valid_priority:
-            source_key = source_name.lower()
+        for source_key in valid_priority:
             handler_name, handler_func = source_handlers[source_key]
             try:
                 # 🔥 使用 asyncio.to_thread 避免阻塞事件循环
@@ -836,7 +850,7 @@ class ForeignStockService:
                     logger.info(f"✅ {data_source}获取港股K线成功: {code}")
                     break
             except Exception as e:
-                logger.warning(f"⚠️ {source_name}获取K线失败: {e}")
+                logger.warning(f"⚠️ {source_key}获取K线失败: {e}")
                 continue
 
         if not kline_data:
@@ -881,27 +895,20 @@ class ForeignStockService:
         # 数据源名称映射
         source_handlers = {
             'alpha_vantage': ('alpha_vantage', self._get_us_kline_from_alpha_vantage),
-            'yahoo_finance': ('yfinance', self._get_us_kline_from_yfinance),
+            'yfinance': ('yfinance', self._get_us_kline_from_yfinance),
             'finnhub': ('finnhub', self._get_us_kline_from_finnhub),
         }
 
         # 过滤有效数据源并去重
-        valid_priority = []
-        seen = set()
-        for source_name in source_priority:
-            source_key = source_name.lower()
-            if source_key in source_handlers and source_key not in seen:
-                seen.add(source_key)
-                valid_priority.append(source_name)
+        valid_priority = self._resolve_valid_sources(source_priority, source_handlers)
 
         if not valid_priority:
             logger.warning("⚠️ 数据库中没有配置有效的美股数据源，使用默认顺序")
-            valid_priority = ['yahoo_finance', 'alpha_vantage', 'finnhub']
+            valid_priority = ['yfinance', 'alpha_vantage', 'finnhub']
 
         logger.info(f"📊 [US K线有效数据源] {valid_priority}")
 
-        for source_name in valid_priority:
-            source_key = source_name.lower()
+        for source_key in valid_priority:
             handler_name, handler_func = source_handlers[source_key]
             try:
                 # 🔥 使用 asyncio.to_thread 避免阻塞事件循环
@@ -913,7 +920,7 @@ class ForeignStockService:
                     logger.info(f"✅ {data_source}获取美股K线成功: {code}")
                     break
             except Exception as e:
-                logger.warning(f"⚠️ {source_name}获取K线失败: {e}")
+                logger.warning(f"⚠️ {source_key}获取K线失败: {e}")
                 continue
 
         if not kline_data:
